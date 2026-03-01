@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!-- Main app theme -->
+    <style name="Theme.MediaDL" parent="android:Theme.Material.Light.NoActionBar" />
+
+    <!-- Splash screen theme (shown on cold start) -->
+    <style name="Theme.MediaDL.Splash" parent="Theme.SplashScreen">
+        <!-- Dark background matching app Ink2 -->
+        <item name="windowSplashScreenBackground">#0A0D16</item>
+        <!-- Animated icon: spinning colorful arcs -->
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_splash_animated</item>
+        <!-- How long the custom animation plays (ms) -->
+        <item name="windowSplashScreenAnimationDuration">1400</item>
+        <!-- Theme to apply after splash dismisses -->
+        <item name="postSplashScreenTheme">@style/Theme.MediaDL</item>
+    </style>
+
+</resources>
