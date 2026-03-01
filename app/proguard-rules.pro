@@ -1,40 +1,40 @@
 # ── Stack traces: keep line numbers for crash reports ───────────────────────────
--keepattributes SourceFile,LineNumberTable
+-keepattributes SourceFile,LineNumberTable,Exceptions,InnerClasses,Signature
 -renamesourcefileattribute SourceFile
 
-# ── youtubedl-android (JNI + reflection) ────────────────────────────────────────
+# ── App: keep ALL classes in our own package ─────────────────────────────────────
+# Without this, R8 renames MainActivity/MediaDLApplication and the app crashes.
+-keep class com.bismaya.mediadl.** { *; }
+-keepclassmembers class com.bismaya.mediadl.** { *; }
+
+# ── youtubedl-android + FFmpeg (JNI + heavy reflection) ─────────────────────────
+# The library loads native .so by class name at runtime — must not be renamed.
 -keep class com.yausername.** { *; }
--keep class com.github.junkfood02.** { *; }
--keep class io.github.junkfood02.** { *; }
+-keepclassmembers class com.yausername.** { *; }
+-keepclasseswithmembernames class com.yausername.** {
+    native <methods>;
+}
 -dontwarn com.yausername.**
 -dontwarn io.github.junkfood02.**
 
-# ── Coil image loading ───────────────────────────────────────────────────────────
+# ── Coil (registered via ServiceLoader) ──────────────────────────────────────────
 -dontwarn coil.**
--keep class coil.** { *; }
 
-# ── Kotlin ───────────────────────────────────────────────────────────────────────
--keep class kotlin.Metadata { *; }
--keepclassmembers class **$WhenMappings { *; }
--keepclassmembers class kotlin.coroutines.** { *; }
--dontwarn kotlin.**
+# ── Kotlin coroutines (volatile fields used by coroutine machinery) ───────────────
+-keepclassmembernames class kotlinx.** {
+    volatile <fields>;
+}
 
-# ── AndroidX / Jetpack Compose ───────────────────────────────────────────────────
--keep class androidx.compose.** { *; }
--dontwarn androidx.compose.**
-
-# ── ViewModel — keep all ViewModel subclasses ────────────────────────────────────
--keep class * extends androidx.lifecycle.ViewModel { *; }
-
-# ── App data classes (used in JSON parsing + SharedPrefs) ────────────────────────
--keep class com.bismaya.mediadl.DownloadRecord { *; }
--keep class com.bismaya.mediadl.VideoInfo { *; }
--keep class com.bismaya.mediadl.VideoFormat { *; }
+# ── ViewModel factory (instantiated via reflection) ──────────────────────────────
+-keep class * extends androidx.lifecycle.ViewModel {
+    <init>(android.app.Application);
+    <init>();
+}
 
 # ── JSON ─────────────────────────────────────────────────────────────────────────
 -keep class org.json.** { *; }
 
-# ── Remove all android.util.Log calls in release ─────────────────────────────────
+# ── Remove Log calls in release ──────────────────────────────────────────────────
 -assumenosideeffects class android.util.Log {
     public static int v(...);
     public static int d(...);
@@ -42,4 +42,3 @@
     public static int w(...);
     public static int e(...);
 }
-#-renamesourcefileattribute SourceFile

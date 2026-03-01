@@ -26,6 +26,13 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // Only package arm64 — covers all modern Android 7+ devices (64-bit).
+        // armeabi-v7a (32-bit) accounts for ~42MB and applies to essentially
+        // zero real devices at API 24+. Drop it to halve the APK size.
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
     }
 
     signingConfigs {
