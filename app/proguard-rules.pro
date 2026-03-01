@@ -2,10 +2,28 @@
 -keepattributes SourceFile,LineNumberTable,Exceptions,InnerClasses,Signature
 -renamesourcefileattribute SourceFile
 
-# ── App: keep ALL classes in our own package ─────────────────────────────────────
-# Without this, R8 renames MainActivity/MediaDLApplication and the app crashes.
--keep class com.bismaya.mediadl.** { *; }
--keepclassmembers class com.bismaya.mediadl.** { *; }
+# ── Disable obfuscation and optimization ─────────────────────────────────────────
+-dontobfuscate
+-dontoptimize
+
+# ── youtubedl-android + FFmpeg (JNI — must not be removed by shrinking) ──────────
+-keep class com.yausername.** { *; }
+-keepclassmembers class com.yausername.** { *; }
+-dontwarn com.yausername.**
+
+# ── Apache Commons Compress (transitive dep of youtubedl-android) ─────────────────
+# ZipUtils.unzip() registers extra field handlers (e.g. AsiExtraField) at runtime
+# via a factory — R8 shrinker removes them as "unused" → ExceptionInInitializerError
+-keep class org.apache.commons.compress.** { *; }
+-keepclassmembers class org.apache.commons.compress.** { *; }
+-dontwarn org.apache.commons.**
+
+# ── ViewModel factory (instantiated via reflection) ──────────────────────────────
+-keep class * extends androidx.lifecycle.ViewModel { *; }
+-keep class * extends androidx.lifecycle.AndroidViewModel { *; }
+
+# ── JSON ─────────────────────────────────────────────────────────────────────────
+-keep class org.json.** { *; }
 
 # ── youtubedl-android + FFmpeg (JNI + heavy reflection) ─────────────────────────
 # The library loads native .so by class name at runtime — must not be renamed.
