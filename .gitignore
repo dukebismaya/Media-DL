@@ -21,6 +21,7 @@ local.properties
 keystore.properties
 *.jks
 *.keystore
+mediadl-release-key
 google-services.json
 GoogleService-Info.plist
 reference/
@@ -29,6 +30,7 @@ reference/
 *.apk
 *.aab
 *.ap_
+*.log
 
 # ── OS artifacts ────────────────────────────────────────────────────────────────
 .DS_Store

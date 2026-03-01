@@ -1,21 +1,45 @@
-# Add project specific ProGuard rules here.
-# You can control the set of applied configuration files using the
-# proguardFiles setting in build.gradle.
-#
-# For more details, see
-#   http://developer.android.com/guide/developing/tools/proguard.html
+# ── Stack traces: keep line numbers for crash reports ───────────────────────────
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# ── youtubedl-android (JNI + reflection) ────────────────────────────────────────
+-keep class com.yausername.** { *; }
+-keep class com.github.junkfood02.** { *; }
+-keep class io.github.junkfood02.** { *; }
+-dontwarn com.yausername.**
+-dontwarn io.github.junkfood02.**
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
+# ── Coil image loading ───────────────────────────────────────────────────────────
+-dontwarn coil.**
+-keep class coil.** { *; }
 
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
+# ── Kotlin ───────────────────────────────────────────────────────────────────────
+-keep class kotlin.Metadata { *; }
+-keepclassmembers class **$WhenMappings { *; }
+-keepclassmembers class kotlin.coroutines.** { *; }
+-dontwarn kotlin.**
+
+# ── AndroidX / Jetpack Compose ───────────────────────────────────────────────────
+-keep class androidx.compose.** { *; }
+-dontwarn androidx.compose.**
+
+# ── ViewModel — keep all ViewModel subclasses ────────────────────────────────────
+-keep class * extends androidx.lifecycle.ViewModel { *; }
+
+# ── App data classes (used in JSON parsing + SharedPrefs) ────────────────────────
+-keep class com.bismaya.mediadl.DownloadRecord { *; }
+-keep class com.bismaya.mediadl.VideoInfo { *; }
+-keep class com.bismaya.mediadl.VideoFormat { *; }
+
+# ── JSON ─────────────────────────────────────────────────────────────────────────
+-keep class org.json.** { *; }
+
+# ── Remove all android.util.Log calls in release ─────────────────────────────────
+-assumenosideeffects class android.util.Log {
+    public static int v(...);
+    public static int d(...);
+    public static int i(...);
+    public static int w(...);
+    public static int e(...);
+}
 #-renamesourcefileattribute SourceFile

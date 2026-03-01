@@ -3094,19 +3094,19 @@ fun AboutScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                 icon = Icons.Outlined.Description,
                 label = "Terms of Use",
                 color = TextSecondary
-            ) { uriHandler.openUri("https://bismaya.xyz") }
+            ) { uriHandler.openUri("https://mediadl.bismaya.xyz/terms.html") }
 
             AboutLinkRow(
                 icon = Icons.Outlined.Shield,
                 label = "Privacy Policy",
                 color = TextSecondary
-            ) { uriHandler.openUri("https://bismaya.xyz") }
+            ) { uriHandler.openUri("https://mediadl.bismaya.xyz/privacy.html") }
 
             AboutLinkRow(
                 icon = Icons.Outlined.Copyright,
                 label = "DMCA / Copyright",
                 color = TextSecondary
-            ) { uriHandler.openUri("https://bismaya.xyz") }
+            ) { uriHandler.openUri("https://mediadl.bismaya.xyz/dmca.html") }
         }
 
         Spacer(modifier = Modifier.height(24.dp))

@@ -1,6 +1,6 @@
 <div align="center">
 
-# MM-DL
+# Media-DL
 
 **A minimal, Android app to download videos and audio from the web.**
 
