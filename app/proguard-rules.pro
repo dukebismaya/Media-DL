@@ -35,6 +35,15 @@
 -dontwarn com.yausername.**
 -dontwarn io.github.junkfood02.**
 
+# ── libtorrent4j (JNI + SWIG bindings) ──────────────────────────────────────────
+-keep class org.libtorrent4j.** { *; }
+-keepclassmembers class org.libtorrent4j.** { *; }
+-keepclasseswithmembernames class org.libtorrent4j.** {
+    native <methods>;
+}
+-keep class org.libtorrent4j.swig.** { *; }
+-dontwarn org.libtorrent4j.**
+
 # ── Coil (registered via ServiceLoader) ──────────────────────────────────────────
 -dontwarn coil.**
 

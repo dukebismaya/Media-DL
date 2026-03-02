@@ -275,6 +275,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 // User cancelled – return to Idle silently
                 screenState = ScreenState.Idle
             } catch (e: Exception) {
+                CrashLogger.logException(appContext, "MainViewModel.fetch", e)
                 val rawMsg = e.localizedMessage ?: e.message ?: ""
                 val cleanMsg = cleanErrorMessage(rawMsg)
                 if ("403" in rawMsg || "older than" in rawMsg || "Forbidden" in rawMsg) {
@@ -489,6 +490,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     hapticEvent = HapticType.ERROR
                 }
             } catch (e: Exception) {
+                CrashLogger.logException(appContext, "MainViewModel.download", e)
                 cancelProgressNotification(appContext)
                 val rawMsg = e.localizedMessage ?: e.message ?: "Unknown error"
                 statusMessage = "Download failed: ${cleanErrorMessage(rawMsg)}"

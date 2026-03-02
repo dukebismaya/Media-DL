@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <external-path name="downloads" path="Download/MediaDL" />
+    <external-path name="torrents" path="Download/MediaDL/Torrents" />
+    <external-path name="movies" path="Movies/MediaDL" />
+    <external-path name="music" path="Music/MediaDL" />
+    <external-path name="root" path="." />
+</paths>

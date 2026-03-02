@@ -91,8 +91,23 @@ enum class DateFilter(val label: String) { ALL("All Time"), TODAY("Today"), WEEK
 enum class NavTab(val label: String, val icon: ImageVector, val selectedIcon: ImageVector) {
     HOME("Home", Icons.Outlined.Home, Icons.Rounded.Home),
     DOWNLOADS("Downloads", Icons.Outlined.Download, Icons.Rounded.Download),
+    TORRENT("Torrent", Icons.Outlined.CloudDownload, Icons.Rounded.CloudDownload),
     HISTORY("History", Icons.Outlined.History, Icons.Rounded.History),
     ABOUT("About", Icons.Outlined.Info, Icons.Rounded.Info)
+}
+
+// --- Input Type Detection (SmartBar) -------------------------------------------
+enum class InputType { EMPTY, URL, MAGNET, TORRENT_URL, SEARCH }
+
+fun detectInputType(input: String): InputType {
+    val t = input.trim()
+    return when {
+        t.isBlank() -> InputType.EMPTY
+        t.startsWith("magnet:?", ignoreCase = true) || t.startsWith("magnet:", ignoreCase = true) -> InputType.MAGNET
+        t.matches(Regex("https?://.*\\.torrent(\\?.*)?$", RegexOption.IGNORE_CASE)) -> InputType.TORRENT_URL
+        t.startsWith("http://") || t.startsWith("https://") -> InputType.URL
+        else -> InputType.SEARCH
+    }
 }
 
 // --- Data Classes ---------------------------------------------------------------
@@ -352,14 +367,14 @@ fun playMedia(context: Context, record: DownloadRecord) {
 class MainActivity : ComponentActivity() {
 
     // Holds a URL shared into the app from the system share sheet.
-    // mutableStateOf ensures recomposition when updated via onNewIntent.
     private var sharedUrl by mutableStateOf<String?>(null)
+    // Holds a magnet URI received via intent (deep link or share)
+    private var sharedMagnet by mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
         super.onCreate(savedInstanceState)
-        // Pick up URL if the app was cold-started via the share sheet
-        sharedUrl = extractSharedUrl(intent)
+        processIncomingIntent(intent)
         createNotificationChannel(this)
         enableEdgeToEdge()
         setContent {
@@ -367,28 +382,50 @@ class MainActivity : ComponentActivity() {
                 Surface(modifier = Modifier.fillMaxSize(), color = Ink) {
                     MediaDLApp(
                         sharedUrl = sharedUrl,
-                        onSharedUrlConsumed = { sharedUrl = null }
+                        onSharedUrlConsumed = { sharedUrl = null },
+                        sharedMagnet = sharedMagnet,
+                        onSharedMagnetConsumed = { sharedMagnet = null }
                     )
                 }
             }
         }
     }
 
-    /** Called when the app is already running and receives a new share intent. */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        extractSharedUrl(intent)?.let { sharedUrl = it }
+        processIncomingIntent(intent)
     }
 
-    /**
-     * Extracts the first HTTP/HTTPS URL from an ACTION_SEND text/plain intent.
-     * Returns null for any other intent type.
-     */
-    private fun extractSharedUrl(intent: Intent?): String? {
-        if (intent?.action != Intent.ACTION_SEND) return null
-        if (intent.type != "text/plain") return null
-        val text = intent.getStringExtra(Intent.EXTRA_TEXT) ?: return null
-        return Regex("""https?://\S+""").find(text.trim())?.value
+    private fun processIncomingIntent(intent: Intent?) {
+        if (intent == null) return
+        when (intent.action) {
+            Intent.ACTION_SEND -> {
+                if (intent.type == "text/plain") {
+                    val text = intent.getStringExtra(Intent.EXTRA_TEXT) ?: return
+                    val trimmed = text.trim()
+                    if (trimmed.startsWith("magnet:", ignoreCase = true)) {
+                        sharedMagnet = trimmed
+                    } else {
+                        Regex("""https?://\S+""").find(trimmed)?.value?.let { sharedUrl = it }
+                    }
+                }
+            }
+            Intent.ACTION_VIEW -> {
+                val uri = intent.data ?: return
+                when {
+                    uri.scheme.equals("magnet", ignoreCase = true) -> {
+                        sharedMagnet = uri.toString()
+                    }
+                    intent.type == "application/x-bittorrent" ||
+                    uri.toString().endsWith(".torrent", ignoreCase = true) -> {
+                        sharedMagnet = uri.toString()
+                    }
+                    else -> {
+                        sharedUrl = uri.toString()
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -398,7 +435,9 @@ class MainActivity : ComponentActivity() {
 fun MediaDLApp(
     vm: MainViewModel = viewModel(),
     sharedUrl: String? = null,
-    onSharedUrlConsumed: () -> Unit = {}
+    onSharedUrlConsumed: () -> Unit = {},
+    sharedMagnet: String? = null,
+    onSharedMagnetConsumed: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val view = LocalView.current
@@ -481,6 +520,21 @@ fun MediaDLApp(
         }
     }
 
+    val torrentVm: TorrentViewModel = viewModel()
+
+    // Handle shared magnet link (from deep link or share)
+    LaunchedEffect(sharedMagnet) {
+        val magnet = sharedMagnet ?: return@LaunchedEffect
+        vm.currentNavTab = NavTab.TORRENT
+        if (magnet.startsWith("magnet:", ignoreCase = true)) {
+            torrentVm.onMagnetInputChange(magnet)
+            torrentVm.addMagnet()
+        } else {
+            torrentVm.addMagnetDirect(magnet)
+        }
+        onSharedMagnetConsumed()
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
         AuroraBackground()
 
@@ -497,11 +551,17 @@ fun MediaDLApp(
             HorizontalPager(
                 state = pagerState,
                 modifier = Modifier.fillMaxSize(),
-                beyondViewportPageCount = 1
+                beyondViewportPageCount = 0
             ) { page ->
                 when (NavTab.entries[page]) {
-                    NavTab.HOME -> HomeScreen(vm = vm, modifier = Modifier.padding(paddingValues))
+                    NavTab.HOME -> HomeScreen(
+                        vm = vm,
+                        torrentVm = torrentVm,
+                        onNavigateToTorrent = { vm.currentNavTab = NavTab.TORRENT },
+                        modifier = Modifier.padding(paddingValues)
+                    )
                     NavTab.DOWNLOADS -> DownloadsScreen(vm = vm, modifier = Modifier.padding(paddingValues))
+                    NavTab.TORRENT -> TorrentScreen(vm = torrentVm, modifier = Modifier.padding(paddingValues))
                     NavTab.HISTORY -> HistoryScreen(vm = vm, modifier = Modifier.padding(paddingValues))
                     NavTab.ABOUT -> AboutScreen(vm = vm, modifier = Modifier.padding(paddingValues))
                 }
@@ -601,7 +661,12 @@ fun BottomNavBar(
 // --- Home Screen (main download page) -------------------------------------------
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun HomeScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
+fun HomeScreen(
+    vm: MainViewModel,
+    torrentVm: TorrentViewModel? = null,
+    onNavigateToTorrent: () -> Unit = {},
+    modifier: Modifier = Modifier
+) {
     val scrollState = rememberScrollState()
     val keyboardController = LocalSoftwareKeyboardController.current
     val screenState = vm.screenState
@@ -632,8 +697,8 @@ fun HomeScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                 HeroSection()
             }
 
-            // Search Bar
-            SearchBar(
+            // Smart Bar
+            SmartBar(
                 url = vm.url,
                 onUrlChange = { vm.onUrlChange(it) },
                 screenState = screenState,
@@ -647,6 +712,33 @@ fun HomeScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                 },
                 onClear = {
                     vm.clearResult()
+                },
+                onAddTorrent = {
+                    torrentVm?.let { tvm ->
+                        tvm.onMagnetInputChange(vm.url.trim())
+                        tvm.addMagnet()
+                    }
+                    onNavigateToTorrent()
+                },
+                onSearchTorrents = {
+                    torrentVm?.let { tvm ->
+                        tvm.activeTab = TorrentTab.SEARCH
+                        tvm.onSearchQueryChange(vm.url.trim())
+                        tvm.searchTorrents()
+                    }
+                    onNavigateToTorrent()
+                }
+            )
+
+            // Quick-action chips
+            SmartBarChips(
+                onSearchTorrents = {
+                    torrentVm?.activeTab = TorrentTab.SEARCH
+                    onNavigateToTorrent()
+                },
+                onBrowseFiles = {
+                    torrentVm?.activeTab = TorrentTab.FILES
+                    onNavigateToTorrent()
                 }
             )
 
@@ -834,7 +926,7 @@ fun ActiveDownloadCard(
 
     // Smooth animated fill
     val animatedProgress by animateFloatAsState(
-        targetValue = (progress / 100f).coerceIn(0f, 1f),
+        targetValue = progress.coerceIn(0f, 1f),
         animationSpec = tween(400, easing = FastOutSlowInEasing),
         label = "bar_fill"
     )
@@ -917,7 +1009,7 @@ fun ActiveDownloadCard(
                         }
                         if (progress > 0f) {
                             Text(
-                                "${progress.toInt()}%",
+                                "${(progress * 100).toInt()}%",
                                 color = Emerald,
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Bold
@@ -2081,21 +2173,24 @@ fun PulsingDot() {
     Box(modifier = Modifier.size(6.dp).alpha(alpha).clip(CircleShape).background(VioletLight))
 }
 
-// --- Search Bar -----------------------------------------------------------------
+// --- SmartBar (enhanced URL bar with magnet/torrent detection) ------------------
 @Composable
-fun SearchBar(
+fun SmartBar(
     url: String,
     onUrlChange: (String) -> Unit,
     screenState: ScreenState,
     isUrlValid: Boolean,
     onFetch: () -> Unit,
     onCancel: () -> Unit,
-    onClear: () -> Unit
+    onClear: () -> Unit,
+    onAddTorrent: () -> Unit = {},
+    onSearchTorrents: () -> Unit = {}
 ) {
+    val inputType = remember(url) { detectInputType(url) }
     val platform = remember(url) { detectPlatform(url) }
     val isFetching = screenState is ScreenState.Fetching
     val isSuccess = screenState is ScreenState.Success
-    val fetchEnabled = !isFetching && isUrlValid
+    val fetchEnabled = !isFetching && (isUrlValid || inputType == InputType.MAGNET || inputType == InputType.TORRENT_URL || inputType == InputType.SEARCH)
 
     // Animate border color based on state
     val borderColor by animateColorAsState(
@@ -2103,10 +2198,12 @@ fun SearchBar(
             isFetching -> Violet.copy(alpha = 0.45f)
             isSuccess -> Emerald.copy(alpha = 0.3f)
             screenState is ScreenState.Error -> Rose.copy(alpha = 0.25f)
+            inputType == InputType.MAGNET -> Cyan.copy(alpha = 0.35f)
+            inputType == InputType.TORRENT_URL -> Amber.copy(alpha = 0.35f)
             else -> SurfaceBorder.copy(alpha = 0.15f)
         },
         animationSpec = tween(350),
-        label = "searchBorder"
+        label = "smartBorder"
     )
 
     Column(modifier = Modifier.padding(horizontal = 20.dp)) {
@@ -2122,7 +2219,7 @@ fun SearchBar(
                 OutlinedTextField(
                     value = url,
                     onValueChange = onUrlChange,
-                    placeholder = { Text("Paste a video URL...", color = TextTertiary, fontSize = 14.sp) },
+                    placeholder = { Text("Paste a URL, magnet link, or search…", color = TextTertiary, fontSize = 14.sp) },
                     singleLine = true,
                     enabled = !isFetching,
                     modifier = Modifier.weight(1f),
@@ -2137,7 +2234,6 @@ fun SearchBar(
                     ),
                     textStyle = LocalTextStyle.current.copy(fontSize = 14.sp),
                     trailingIcon = {
-                        // Clear 'X' button — visible only in Success state
                         AnimatedVisibility(
                             visible = isSuccess,
                             enter = fadeIn(tween(200)) + scaleIn(tween(200)),
@@ -2152,41 +2248,49 @@ fun SearchBar(
                                     .clickable { onClear() },
                                 contentAlignment = Alignment.Center
                             ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.Close,
-                                    contentDescription = "Clear",
-                                    tint = TextSecondary,
-                                    modifier = Modifier.size(14.dp)
-                                )
+                                Icon(Icons.Rounded.Close, "Clear", tint = TextSecondary, modifier = Modifier.size(14.dp))
                             }
                         }
                     }
                 )
 
-                if (platform != null && !isFetching) {
+                // Type indicator pill
+                val pillText = when (inputType) {
+                    InputType.MAGNET -> "Magnet"
+                    InputType.TORRENT_URL -> "Torrent"
+                    InputType.SEARCH -> if (url.isNotBlank()) "Search" else null
+                    InputType.URL -> platform
+                    else -> null
+                }
+                val pillColor = when (inputType) {
+                    InputType.MAGNET -> Cyan
+                    InputType.TORRENT_URL -> Amber
+                    InputType.SEARCH -> Emerald
+                    else -> VioletLight
+                }
+                if (pillText != null && !isFetching) {
                     Box(
                         modifier = Modifier
                             .clip(RoundedCornerShape(999.dp))
-                            .background(VioletDim)
-                            .border(1.dp, Violet.copy(alpha = 0.25f), RoundedCornerShape(999.dp))
+                            .background(pillColor.copy(alpha = 0.12f))
+                            .border(1.dp, pillColor.copy(alpha = 0.25f), RoundedCornerShape(999.dp))
                             .padding(horizontal = 10.dp, vertical = 4.dp)
                     ) {
-                        Text(platform, color = VioletLight, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                        Text(pillText, color = pillColor, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                     }
                     Spacer(modifier = Modifier.width(8.dp))
                 }
 
-                // ── Fetch / Stop button with crossfade ──
+                // ── Smart action buttons ──
                 AnimatedContent(
-                    targetState = isFetching,
+                    targetState = Pair(isFetching, inputType),
                     transitionSpec = {
                         (fadeIn(tween(200)) + scaleIn(tween(200), initialScale = 0.85f))
                             .togetherWith(fadeOut(tween(150)) + scaleOut(tween(150), targetScale = 0.85f))
                     },
-                    label = "fetchBtnSwap"
-                ) { fetching ->
+                    label = "smartBtnSwap"
+                ) { (fetching, type) ->
                     if (fetching) {
-                        // STOP button
                         Button(
                             onClick = onCancel,
                             modifier = Modifier.height(44.dp),
@@ -2194,34 +2298,99 @@ fun SearchBar(
                             colors = ButtonDefaults.buttonColors(containerColor = Rose.copy(alpha = 0.85f)),
                             contentPadding = PaddingValues(horizontal = 18.dp)
                         ) {
-                            Icon(Icons.Rounded.Close, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Icon(Icons.Rounded.Close, null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(4.dp))
                             Text("Stop", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
                         }
                     } else {
-                        // FETCH button — dimmed when URL invalid
-                        Button(
-                            onClick = onFetch,
-                            enabled = fetchEnabled,
-                            modifier = Modifier.height(44.dp),
-                            shape = RoundedCornerShape(20.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = Violet,
-                                disabledContainerColor = Violet.copy(alpha = 0.25f)
-                            ),
-                            contentPadding = PaddingValues(horizontal = 20.dp)
-                        ) {
-                            Text(
-                                "Fetch",
-                                fontWeight = FontWeight.SemiBold,
-                                fontSize = 14.sp,
-                                color = if (fetchEnabled) Color.White else Color.White.copy(alpha = 0.4f)
-                            )
+                        when (type) {
+                            InputType.MAGNET, InputType.TORRENT_URL -> {
+                                Button(
+                                    onClick = onAddTorrent,
+                                    modifier = Modifier.height(44.dp),
+                                    shape = RoundedCornerShape(20.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = Cyan.copy(alpha = 0.85f)),
+                                    contentPadding = PaddingValues(horizontal = 18.dp)
+                                ) {
+                                    Icon(Icons.Outlined.CloudDownload, null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Torrent", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                                }
+                            }
+                            InputType.SEARCH -> {
+                                Button(
+                                    onClick = onSearchTorrents,
+                                    enabled = url.isNotBlank(),
+                                    modifier = Modifier.height(44.dp),
+                                    shape = RoundedCornerShape(20.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = Emerald.copy(alpha = 0.85f)),
+                                    contentPadding = PaddingValues(horizontal = 14.dp)
+                                ) {
+                                    Icon(Icons.Rounded.Search, null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Torrents", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                                }
+                            }
+                            else -> {
+                                Button(
+                                    onClick = onFetch,
+                                    enabled = !isFetching && isUrlValid,
+                                    modifier = Modifier.height(44.dp),
+                                    shape = RoundedCornerShape(20.dp),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = Violet,
+                                        disabledContainerColor = Violet.copy(alpha = 0.25f)
+                                    ),
+                                    contentPadding = PaddingValues(horizontal = 20.dp)
+                                ) {
+                                    Text(
+                                        "Fetch",
+                                        fontWeight = FontWeight.SemiBold,
+                                        fontSize = 14.sp,
+                                        color = if (!isFetching && isUrlValid) Color.White else Color.White.copy(alpha = 0.4f)
+                                    )
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+    }
+}
+
+// --- Smart Bar Chips (quick actions below search bar) ---------------------------
+@Composable
+fun SmartBarChips(
+    onSearchTorrents: () -> Unit,
+    onBrowseFiles: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        SmartChip(Icons.Rounded.Search, "Search Torrents", Emerald) { onSearchTorrents() }
+        SmartChip(Icons.Outlined.Folder, "Browse Files", Cyan) { onBrowseFiles() }
+    }
+}
+
+@Composable
+private fun SmartChip(icon: ImageVector, label: String, color: Color, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(color.copy(alpha = 0.08f))
+            .border(1.dp, color.copy(alpha = 0.15f), RoundedCornerShape(999.dp))
+            .clickable { onClick() }
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, null, tint = color, modifier = Modifier.size(14.dp))
+        Spacer(modifier = Modifier.width(6.dp))
+        Text(label, color = color, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
     }
 }
 
@@ -2729,6 +2898,16 @@ fun AboutScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
         context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "1.0"
     } catch (_: Exception) { "1.0" }
 
+    var showCrashDebugger by remember { mutableStateOf(false) }
+
+    if (showCrashDebugger) {
+        CrashDebuggerScreen(
+            onBack = { showCrashDebugger = false },
+            modifier = modifier
+        )
+        return
+    }
+
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -3061,6 +3240,63 @@ fun AboutScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                     imageVector = Icons.Outlined.OpenInNew,
                     contentDescription = null,
                     tint = Emerald.copy(alpha = 0.5f),
+                    modifier = Modifier.size(16.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // Crash Debugger button
+            val crashLogCount = remember { CrashLogger.getCrashLogs(context).size }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(Amber.copy(alpha = 0.08f))
+                    .border(1.dp, Amber.copy(alpha = 0.20f), RoundedCornerShape(10.dp))
+                    .clickable { showCrashDebugger = true }
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.BugReport,
+                    contentDescription = null,
+                    tint = Amber,
+                    modifier = Modifier.size(18.dp)
+                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        "Crash Debugger",
+                        color = Amber,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        "View, share & copy crash logs",
+                        color = Amber.copy(alpha = 0.6f),
+                        fontSize = 11.sp
+                    )
+                }
+                if (crashLogCount > 0) {
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Rose.copy(alpha = 0.15f))
+                            .padding(horizontal = 7.dp, vertical = 2.dp)
+                    ) {
+                        Text(
+                            "$crashLogCount",
+                            color = Rose,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+                Icon(
+                    imageVector = Icons.Outlined.ChevronRight,
+                    contentDescription = null,
+                    tint = Amber.copy(alpha = 0.5f),
                     modifier = Modifier.size(16.dp)
                 )
             }
