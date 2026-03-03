@@ -3,10 +3,12 @@ package com.bismaya.mediadl
 import android.app.Application
 import android.content.Context
 import android.content.Intent
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Environment
+import android.os.PowerManager
 import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
@@ -14,6 +16,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.bismaya.mediadl.core.RepositoryHelper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -60,10 +63,21 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
         private set
     val torrentSearchRecords = mutableStateListOf<TorrentSearchRecord>()
 
+    // ── Search filters (applied client-side after results arrive) ──
+    var searchCategoryFilter by mutableStateOf("All")
+    var searchSizeFilter by mutableStateOf("Any")
+
     // ── Settings state ──
     var settings by mutableStateOf(TorrentPrefs())
         private set
     var showSettings by mutableStateOf(false)
+
+    // ── Battery optimization prompt ──
+    var needsBatteryOptPrompt by mutableStateOf(false)
+
+    // ── Seeding auto-pause tracking ──
+    val autoPausedForSeeding: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    private val prevTorrentStates: MutableMap<String, TorrentState> = ConcurrentHashMap()
 
     // ── File browser state ──
     private val defaultSaveDir: File
@@ -119,6 +133,7 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
                     isEngineRunning = true
                     currentBrowsePath = defaultSaveDir.absolutePath
                     loadBrowseDir()
+                    checkBatteryOptimization()
                 }
                 startObservingTorrents()
             } catch (e: Throwable) {
@@ -141,6 +156,36 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
                 val items = infoList.map { info ->
                     with(TorrentBridge) { info.toItem() }
                 }
+                // ── Seeding auto-stop ──
+                val prefs = settings
+                for (item in items) {
+                    val prevState = prevTorrentStates.put(item.infoHash, item.state)
+                    val isNewlySeeding = item.state == TorrentState.SEEDING && prevState != TorrentState.SEEDING
+                    val isNewlyFinished = item.state == TorrentState.FINISHED && prevState != TorrentState.FINISHED
+
+                    // Trigger MediaStore scan so gallery picks up .mkv and other files
+                    if (isNewlySeeding || isNewlyFinished) {
+                        val scanRoot = defaultSaveDir
+                        val filePaths = scanRoot.walkTopDown()
+                            .filter { it.isFile }
+                            .map { it.absolutePath }
+                            .toList()
+                            .toTypedArray()
+                        if (filePaths.isNotEmpty()) {
+                            MediaScannerConnection.scanFile(appContext, filePaths, null, null)
+                        }
+                    }
+
+                    if (isNewlySeeding && prefs.stopSeedingOnComplete && item.infoHash !in autoPausedForSeeding) {
+                        autoPausedForSeeding.add(item.infoHash)
+                        TorrentBridge.pauseTorrent(item.infoHash)
+                    }
+                    if (item.state == TorrentState.SEEDING && prefs.maxSeedRatio > 0f &&
+                        item.shareRatio >= prefs.maxSeedRatio && item.infoHash !in autoPausedForSeeding) {
+                        autoPausedForSeeding.add(item.infoHash)
+                        TorrentBridge.pauseTorrent(item.infoHash)
+                    }
+                }
                 withContext(Dispatchers.Main) {
                     val newHashes = items.map { it.infoHash }.toSet()
                     for (item in items) {
@@ -157,6 +202,8 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
                 withContext(Dispatchers.Main) {
                     torrents.removeAll { it.infoHash == deletedId }
                     notifiedComplete.remove(deletedId)
+                    autoPausedForSeeding.remove(deletedId)
+                    prevTorrentStates.remove(deletedId)
                 }
             }
         }
@@ -341,6 +388,48 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
         FileOperations.openFile(context, file)
     }
 
+    /**
+     * Returns the file list for a torrent, fetching it live from the engine if
+     * the item's embedded [TorrentItem.files] list is empty (e.g. for completed torrents).
+     * Must only be called from a background coroutine.
+     */
+    fun getFilesForTorrent(hash: String): List<TorrentFileInfo> =
+        TorrentBridge.getFilesForTorrent(hash)
+
+    /**
+     * Deletes specific files belonging to a torrent from disk and triggers a
+     * MediaStore re-scan of the surrounding folder.
+     */
+    fun deleteSelectedFiles(hash: String, fileIndices: Set<Int>) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val fileMeta = TorrentBridge.getFilesForTorrent(hash)
+                val saveRoot = defaultSaveDir
+                val torrentName = torrents.firstOrNull { it.infoHash == hash }?.name ?: ""
+                // Try both <saveRoot>/<name>/<file> and <saveRoot>/<file> layouts
+                for (fi in fileMeta.filter { it.index in fileIndices }) {
+                    val candidates = listOf(
+                        File(saveRoot, "$torrentName/${fi.name}"),
+                        File(saveRoot, fi.name),
+                        File(saveRoot, "${hash.take(8)}/${fi.name}")
+                    )
+                    candidates.firstOrNull { it.exists() }?.delete()
+                }
+                // Re-scan folder so gallery is updated
+                val filePaths = saveRoot.walkTopDown()
+                    .filter { it.isFile }
+                    .map { it.absolutePath }
+                    .toList()
+                    .toTypedArray()
+                if (filePaths.isNotEmpty()) {
+                    MediaScannerConnection.scanFile(appContext, filePaths, null, null)
+                }
+            } catch (e: Exception) {
+                Log.e("TorrentVM", "deleteSelectedFiles failed", e)
+            }
+        }
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     // SEARCH
     // ══════════════════════════════════════════════════════════════════════════
@@ -432,6 +521,29 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
         settings = newSettings
         TorrentSettingsManager.save(appContext, newSettings)
         TorrentBridge.setSpeedLimits(newSettings.downloadSpeedLimit, newSettings.uploadSpeedLimit)
+        // Sync save path to libretorrent's SettingsRepository
+        if (newSettings.savePath.isNotBlank()) {
+            RepositoryHelper.getSettingsRepository(appContext)
+                .saveTorrentsIn("file://" + newSettings.savePath)
+        }
+        // Reset auto-pause cache when seeding settings change
+        autoPausedForSeeding.clear()
+    }
+
+    private fun checkBatteryOptimization() {
+        val pm = appContext.getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (pm.isIgnoringBatteryOptimizations(appContext.packageName)) return
+        val dismissed = appContext.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+            .getBoolean("battery_opt_dismissed", false)
+        if (!dismissed) needsBatteryOptPrompt = true
+    }
+
+    fun dismissBatteryOptPrompt(permanent: Boolean = false) {
+        needsBatteryOptPrompt = false
+        if (permanent) {
+            appContext.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+                .edit().putBoolean("battery_opt_dismissed", true).apply()
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════════

@@ -1411,10 +1411,18 @@ fun DownloadsScreen(vm: MainViewModel, torrentVm: TorrentViewModel, modifier: Mo
             )
         }
 
-        // ── Torrents section ──
+        // ── Torrents section ── (active only)
         val allTorrents = torrentVm.torrents
-        if (allTorrents.isNotEmpty()) {
-            // Section label
+        val autoPausedHashes = torrentVm.autoPausedForSeeding
+        val activeTorrents = allTorrents.filter { t ->
+            t.state == TorrentState.DOWNLOADING || t.state == TorrentState.METADATA ||
+            t.state == TorrentState.CHECKING || t.state == TorrentState.SEEDING
+        }
+        val completedTorrents = allTorrents.filter { t ->
+            t.state == TorrentState.FINISHED || t.state == TorrentState.PAUSED ||
+            t.state == TorrentState.STOPPED || t.state == TorrentState.ERROR
+        }
+        if (activeTorrents.isNotEmpty()) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1440,7 +1448,7 @@ fun DownloadsScreen(vm: MainViewModel, torrentVm: TorrentViewModel, modifier: Mo
                     )
                 }
                 Text(
-                    "${allTorrents.size} item${if (allTorrents.size == 1) "" else "s"}",
+                    "${activeTorrents.size} active",
                     color = TextTertiary,
                     fontSize = 11.sp
                 )
@@ -1451,9 +1459,10 @@ fun DownloadsScreen(vm: MainViewModel, torrentVm: TorrentViewModel, modifier: Mo
                     .padding(horizontal = 20.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                allTorrents.forEach { torrent ->
+                activeTorrents.forEach { torrent ->
                     DownloadsTorrentRow(
                         torrent = torrent,
+                        autoPausedHashes = autoPausedHashes,
                         onOpenTorrentTab = { vm.currentNavTab = NavTab.TORRENT },
                         onPause  = { torrentVm.pauseTorrent(torrent.infoHash) },
                         onResume = { torrentVm.resumeTorrent(torrent.infoHash) },
@@ -1542,7 +1551,57 @@ fun DownloadsScreen(vm: MainViewModel, torrentVm: TorrentViewModel, modifier: Mo
                 onDateFilterChange = { vm.downloadsDateFilter = it }
             )
 
-            Spacer(modifier = Modifier.height(12.dp))
+            // ── Completed torrents section (below search bar) ──
+            if (completedTorrents.isNotEmpty()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 20.dp)
+                        .padding(bottom = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Outlined.CheckCircle,
+                            contentDescription = null,
+                            tint = Emerald,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            "COMPLETED TORRENTS",
+                            color = Emerald,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 1.sp
+                        )
+                    }
+                    Text(
+                        "${completedTorrents.size} item${if (completedTorrents.size == 1) "" else "s"}",
+                        color = TextTertiary,
+                        fontSize = 11.sp
+                    )
+                }
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 20.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    completedTorrents.forEach { torrent ->
+                        DownloadsTorrentRow(
+                            torrent = torrent,
+                            autoPausedHashes = autoPausedHashes,
+                            onOpenTorrentTab = { vm.currentNavTab = NavTab.TORRENT },
+                            onPause  = {},
+                            onResume = { torrentVm.resumeTorrent(torrent.infoHash) },
+                            onCancel = { torrentVm.requestDelete(torrent.infoHash) }
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(12.dp))
+            }
 
             if (filtered.isEmpty()) {
                 // No results after filtering/search
@@ -1899,39 +1958,43 @@ fun DownloadItem(
 @Composable
 fun DownloadsTorrentRow(
     torrent: TorrentItem,
+    autoPausedHashes: Set<String> = emptySet(),
     onOpenTorrentTab: () -> Unit,
     onPause: () -> Unit = {},
     onResume: () -> Unit = {},
     onCancel: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
-    val stateColor = when (torrent.state) {
-        TorrentState.DOWNLOADING, TorrentState.METADATA -> Cyan
-        TorrentState.FINISHED, TorrentState.SEEDING     -> Emerald
-        TorrentState.PAUSED                             -> Amber
-        TorrentState.ERROR                              -> Rose
-        TorrentState.CHECKING                           -> VioletLight
-        TorrentState.MOVING                             -> Amber
-        TorrentState.QUEUED                             -> TextTertiary
-        TorrentState.STOPPED, TorrentState.UNKNOWN      -> TextTertiary
+    val isCompleted = torrent.infoHash in autoPausedHashes ||
+        torrent.state == TorrentState.FINISHED
+    val stateColor = when {
+        isCompleted -> Emerald
+        torrent.state == TorrentState.DOWNLOADING || torrent.state == TorrentState.METADATA -> Cyan
+        torrent.state == TorrentState.SEEDING -> Emerald
+        torrent.state == TorrentState.PAUSED -> Amber
+        torrent.state == TorrentState.ERROR -> Rose
+        torrent.state == TorrentState.CHECKING -> VioletLight
+        torrent.state == TorrentState.MOVING -> Amber
+        else -> TextTertiary
     }
-    val stateLabel = when (torrent.state) {
-        TorrentState.DOWNLOADING -> "Downloading"
-        TorrentState.METADATA    -> "Metadata…"
-        TorrentState.FINISHED    -> "Completed"
-        TorrentState.SEEDING     -> "Seeding"
-        TorrentState.PAUSED      -> "Paused"
-        TorrentState.ERROR       -> "Error"
-        TorrentState.CHECKING    -> "Checking"
-        TorrentState.QUEUED      -> "Queued"
-        TorrentState.MOVING      -> "Moving…"
-        TorrentState.STOPPED     -> "Stopped"
-        TorrentState.UNKNOWN     -> "Unknown"
+    val stateLabel = when {
+        isCompleted -> "Completed"
+        torrent.state == TorrentState.DOWNLOADING -> "Downloading"
+        torrent.state == TorrentState.METADATA    -> "Metadata…"
+        torrent.state == TorrentState.FINISHED    -> "Completed"
+        torrent.state == TorrentState.SEEDING     -> "Seeding"
+        torrent.state == TorrentState.PAUSED      -> "Paused"
+        torrent.state == TorrentState.ERROR       -> "Error"
+        torrent.state == TorrentState.CHECKING    -> "Checking"
+        torrent.state == TorrentState.QUEUED      -> "Queued"
+        torrent.state == TorrentState.MOVING      -> "Moving…"
+        torrent.state == TorrentState.STOPPED     -> "Stopped"
+        else                                      -> "Unknown"
     }
     val isActive = torrent.state == TorrentState.DOWNLOADING ||
                    torrent.state == TorrentState.METADATA   ||
                    torrent.state == TorrentState.CHECKING
-    val showControls = torrent.state in listOf(
+    val showControls = !isCompleted && torrent.state in listOf(
         TorrentState.DOWNLOADING, TorrentState.METADATA,
         TorrentState.PAUSED, TorrentState.ERROR
     )
@@ -1968,11 +2031,12 @@ fun DownloadsTorrentRow(
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
-                    imageVector = when (torrent.state) {
-                        TorrentState.FINISHED, TorrentState.SEEDING -> Icons.Outlined.CheckCircle
-                        TorrentState.PAUSED                         -> Icons.Outlined.PauseCircle
-                        TorrentState.ERROR                          -> Icons.Outlined.ErrorOutline
-                        else                                        -> Icons.Outlined.Downloading
+                    imageVector = when {
+                        isCompleted -> Icons.Outlined.CheckCircle
+                        torrent.state == TorrentState.FINISHED || torrent.state == TorrentState.SEEDING -> Icons.Outlined.CheckCircle
+                        torrent.state == TorrentState.PAUSED -> Icons.Outlined.PauseCircle
+                        torrent.state == TorrentState.ERROR  -> Icons.Outlined.ErrorOutline
+                        else                                 -> Icons.Outlined.Downloading
                     },
                     contentDescription = null,
                     tint = stateColor,

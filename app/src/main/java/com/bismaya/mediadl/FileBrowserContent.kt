@@ -51,6 +51,7 @@ fun FileBrowserContent(
     onDelete: (FileItem) -> Unit,
     onShare: (FileItem) -> Unit,
     onRename: (FileItem, String) -> Unit,
+    onDeleteMultiple: (List<FileItem>) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     var selectedItem by remember { mutableStateOf<FileItem?>(null) }
@@ -58,6 +59,7 @@ fun FileBrowserContent(
     var showRenameDialog by remember { mutableStateOf(false) }
     var renameText by remember { mutableStateOf("") }
     var showActions by remember { mutableStateOf(false) }
+    var selectedPaths by remember(currentPath) { mutableStateOf(setOf<String>()) }
 
     Column(modifier = modifier.fillMaxWidth()) {
         // ── Path breadcrumb ──
@@ -136,36 +138,78 @@ fun FileBrowserContent(
                 )
             }
         } else {
-            // ── File count ──
+            // ── File count / selection bar ──
             val dirs = items.count { it.isDirectory }
             val files = items.count { !it.isDirectory }
+            val selectionMode = selectedPaths.isNotEmpty()
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 20.dp, vertical = 8.dp)
+                    .padding(horizontal = 20.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    buildString {
-                        if (dirs > 0) append("$dirs folder${if (dirs > 1) "s" else ""}")
-                        if (dirs > 0 && files > 0) append(" · ")
-                        if (files > 0) append("$files file${if (files > 1) "s" else ""}")
-                    },
-                    color = TextTertiary,
-                    fontSize = 11.sp
-                )
+                if (selectionMode) {
+                    Text(
+                        "${selectedPaths.size} selected",
+                        color = VioletLight,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f)
+                    )
+                    TextButton(
+                        onClick = {
+                            selectedPaths = if (selectedPaths.size == items.size) emptySet()
+                            else items.map { it.file.absolutePath }.toSet()
+                        },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                    ) {
+                        Text(
+                            if (selectedPaths.size == items.size) "Deselect All" else "Select All",
+                            color = VioletLight, fontSize = 11.sp
+                        )
+                    }
+                    TextButton(
+                        onClick = {
+                            val toDelete = items.filter { it.file.absolutePath in selectedPaths }
+                            onDeleteMultiple(toDelete)
+                            selectedPaths = emptySet()
+                        },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                    ) {
+                        Icon(Icons.Outlined.Delete, null, tint = Rose, modifier = Modifier.size(14.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Delete (${selectedPaths.size})", color = Rose, fontSize = 11.sp)
+                    }
+                } else {
+                    Text(
+                        buildString {
+                            if (dirs > 0) append("$dirs folder${if (dirs > 1) "s" else ""}")
+                            if (dirs > 0 && files > 0) append(" · ")
+                            if (files > 0) append("$files file${if (files > 1) "s" else ""}")
+                        },
+                        color = TextTertiary,
+                        fontSize = 11.sp
+                    )
+                }
             }
 
             // ── File list ──
             items.forEach { item ->
                 FileItemRow(
                     item = item,
+                    isSelected = item.file.absolutePath in selectedPaths,
+                    selectionMode = selectedPaths.isNotEmpty(),
                     onClick = {
-                        if (item.isDirectory) {
-                            onNavigate(item)
+                        if (selectedPaths.isNotEmpty()) {
+                            val path = item.file.absolutePath
+                            selectedPaths = if (path in selectedPaths) selectedPaths - path else selectedPaths + path
                         } else {
-                            selectedItem = item
-                            showActions = true
+                            if (item.isDirectory) onNavigate(item)
+                            else { selectedItem = item; showActions = true }
                         }
+                    },
+                    onLongClick = {
+                        selectedPaths = selectedPaths + item.file.absolutePath
                     }
                 )
             }
@@ -307,8 +351,15 @@ fun FileBrowserContent(
 }
 
 // ── File Item Row ───────────────────────────────────────────────────────────────
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun FileItemRow(item: FileItem, onClick: () -> Unit) {
+private fun FileItemRow(
+    item: FileItem,
+    isSelected: Boolean = false,
+    selectionMode: Boolean = false,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit = {}
+) {
     val icon = if (item.isDirectory) {
         Icons.Outlined.Folder
     } else {
@@ -340,10 +391,24 @@ private fun FileItemRow(item: FileItem, onClick: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { onClick() }
+            .background(if (isSelected) Violet.copy(alpha = 0.08f) else Color.Transparent)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .padding(horizontal = 20.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
+        if (selectionMode) {
+            Checkbox(
+                checked = isSelected,
+                onCheckedChange = { onClick() },
+                colors = CheckboxDefaults.colors(
+                    checkedColor = Violet,
+                    uncheckedColor = TextTertiary,
+                    checkmarkColor = TextPrimary
+                ),
+                modifier = Modifier.size(24.dp)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+        }
         Box(
             modifier = Modifier
                 .size(40.dp)

@@ -1,12 +1,19 @@
 package com.bismaya.mediadl
 
+import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.os.Environment
+import android.os.PowerManager
+import android.provider.DocumentsContract
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
@@ -32,6 +39,24 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.bismaya.mediadl.ui.theme.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+// Convert a DocumentTree URI (content://...) to an absolute file path
+private fun treeUriToPath(context: Context, treeUri: Uri): String? {
+    return try {
+        val docId = DocumentsContract.getTreeDocumentId(treeUri) ?: return null
+        val split = docId.split(":")
+        if (split.size < 2) return null
+        val type = split[0]
+        val relative = split[1]
+        if (type.equals("primary", ignoreCase = true)) {
+            Environment.getExternalStorageDirectory().absolutePath + if (relative.isNotBlank()) "/$relative" else ""
+        } else {
+            "/storage/$type/$relative"
+        }
+    } catch (_: Exception) { null }
+}
 
 // ══════════════════════════════════════════════════════════════════════════════════
 // TORRENT SCREEN — Main composable with inner tabs
@@ -78,6 +103,27 @@ fun TorrentScreen(
             onDismiss = null
         )
 
+        // ── Battery optimization banner ──
+        if (vm.needsBatteryOptPrompt) {
+            val batteryCtx = LocalContext.current
+            AnimatedBanner(
+                visible = true,
+                text = "Allow background running so torrents continue when app is closed",
+                color = Amber,
+                icon = Icons.Outlined.BatteryAlert,
+                onDismiss = { vm.dismissBatteryOptPrompt(permanent = false) },
+                actionLabel = "Allow",
+                onAction = {
+                    val intent = Intent(
+                        android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        Uri.parse("package:${batteryCtx.packageName}")
+                    )
+                    batteryCtx.startActivity(intent)
+                    vm.dismissBatteryOptPrompt(permanent = true)
+                }
+            )
+        }
+
         // ── Inner tab bar ──
         TorrentTabBar(
             activeTab = vm.activeTab,
@@ -110,7 +156,8 @@ fun TorrentScreen(
                     onOpen = { vm.openBrowseFile(context, it) },
                     onDelete = { vm.deleteBrowseFile(it) },
                     onShare = { vm.shareBrowseFile(context, it) },
-                    onRename = { item, name -> vm.renameBrowseFile(item, name) }
+                    onRename = { item, name -> vm.renameBrowseFile(item, name) },
+                    onDeleteMultiple = { fileItems -> fileItems.forEach { vm.deleteBrowseFile(it) } }
                 )
             }
         }
@@ -478,15 +525,83 @@ private fun SearchTabContent(vm: TorrentViewModel) {
             )
         }
     } else if (vm.searchResults.isNotEmpty()) {
+
+        // ── Filter chips ──
+        val categories = listOf("All", "Video", "Audio", "Games", "Apps", "Other")
+        val sizeFilters = listOf("Any", "<100 MB", "100 MB–1 GB", ">1 GB")
+
+        // Category filter row
+        LazyRow(
+            contentPadding = PaddingValues(horizontal = 20.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            items(categories) { cat ->
+                val selected = vm.searchCategoryFilter == cat
+                val chipColor = when (cat) {
+                    "Video" -> Cyan; "Audio" -> VioletLight; "Games" -> Emerald; "Apps" -> Amber; "Other" -> TextTertiary; else -> Violet
+                }
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(if (selected) chipColor else chipColor.copy(alpha = 0.08f))
+                        .border(1.dp, chipColor.copy(alpha = if (selected) 0f else 0.25f), RoundedCornerShape(20.dp))
+                        .clickable { vm.searchCategoryFilter = cat }
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(cat, color = if (selected) TextPrimary else chipColor, fontSize = 12.sp, fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // Size filter row
+        LazyRow(
+            contentPadding = PaddingValues(horizontal = 20.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            items(sizeFilters) { sf ->
+                val selected = vm.searchSizeFilter == sf
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(if (selected) Violet else Violet.copy(alpha = 0.08f))
+                        .border(1.dp, Violet.copy(alpha = if (selected) 0f else 0.2f), RoundedCornerShape(20.dp))
+                        .clickable { vm.searchSizeFilter = sf }
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(sf, color = if (selected) TextPrimary else VioletLight, fontSize = 12.sp, fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // Apply filters
+        val filteredResults = vm.searchResults.filter { r ->
+            val catOk = vm.searchCategoryFilter == "All" || r.category == vm.searchCategoryFilter
+            val sizeOk = when (vm.searchSizeFilter) {
+                "<100 MB"       -> r.size < 100L * 1024 * 1024
+                "100 MB–1 GB"   -> r.size in (100L * 1024 * 1024)..(1024L * 1024 * 1024)
+                ">1 GB"         -> r.size > 1024L * 1024 * 1024
+                else            -> true
+            }
+            catOk && sizeOk
+        }
+
         Text(
-            "${vm.searchResults.size} results",
+            "${filteredResults.size} results${if (filteredResults.size != vm.searchResults.size) " (filtered from ${vm.searchResults.size})" else ""}",
             color = TextTertiary,
             fontSize = 12.sp,
             modifier = Modifier.padding(horizontal = 20.dp)
         )
         Spacer(modifier = Modifier.height(8.dp))
 
-        vm.searchResults.forEach { result ->
+        filteredResults.forEach { result ->
             SearchResultCard(
                 result = result,
                 onDownload = { vm.addFromSearchResult(result) },
@@ -697,7 +812,7 @@ private fun TorrentCard(
     val stateColor = when (item.state) {
         TorrentState.DOWNLOADING, TorrentState.METADATA -> Cyan
         TorrentState.FINISHED, TorrentState.SEEDING -> Emerald
-        TorrentState.PAUSED -> Amber
+        TorrentState.PAUSED -> if (item.infoHash in vm.autoPausedForSeeding) Emerald else Amber
         TorrentState.ERROR -> Rose
         TorrentState.CHECKING -> VioletLight
         TorrentState.MOVING -> Amber
@@ -710,7 +825,7 @@ private fun TorrentCard(
         TorrentState.METADATA -> "Getting metadata…"
         TorrentState.FINISHED -> "Completed"
         TorrentState.SEEDING -> "Seeding"
-        TorrentState.PAUSED -> "Paused"
+        TorrentState.PAUSED -> if (item.infoHash in vm.autoPausedForSeeding) "Completed" else "Paused"
         TorrentState.ERROR -> "Error"
         TorrentState.CHECKING -> "Checking"
         TorrentState.QUEUED -> "Queued"
@@ -738,7 +853,7 @@ private fun TorrentCard(
                     Icon(
                         imageVector = when (item.state) {
                             TorrentState.FINISHED, TorrentState.SEEDING -> Icons.Outlined.CheckCircle
-                            TorrentState.PAUSED -> Icons.Outlined.PauseCircle
+                            TorrentState.PAUSED -> if (item.infoHash in vm.autoPausedForSeeding) Icons.Outlined.CheckCircle else Icons.Outlined.PauseCircle
                             TorrentState.ERROR -> Icons.Outlined.ErrorOutline
                             TorrentState.CHECKING -> Icons.Outlined.Refresh
                             TorrentState.MOVING -> Icons.Outlined.Autorenew
@@ -1034,19 +1149,91 @@ private fun TorrentExpandedPanel(
 
             // ── FILES tab ──
             1 -> {
-                if (item.files.isEmpty()) {
+                // If the live item has no file metadata, try loading it from the engine
+                var fetchedFiles by remember(item.infoHash) { mutableStateOf<List<TorrentFileInfo>>(emptyList()) }
+                var isLoadingFiles by remember(item.infoHash) { mutableStateOf(false) }
+                LaunchedEffect(item.infoHash) {
+                    if (item.files.isEmpty()) {
+                        isLoadingFiles = true
+                        withContext(Dispatchers.IO) {
+                            val files = vm.getFilesForTorrent(item.infoHash)
+                            withContext(Dispatchers.Main) {
+                                fetchedFiles = files
+                                isLoadingFiles = false
+                            }
+                        }
+                    }
+                }
+                val displayFiles = if (item.files.isEmpty()) fetchedFiles else item.files
+
+                // Multi-select state
+                var selectedIndices by remember(item.infoHash) { mutableStateOf(setOf<Int>()) }
+
+                if (isLoadingFiles) {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(4.dp)) {
+                        CircularProgressIndicator(modifier = Modifier.size(14.dp), color = Cyan, strokeWidth = 2.dp)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Loading file info…", color = TextTertiary, fontSize = 12.sp)
+                    }
+                } else if (displayFiles.isEmpty()) {
                     Text("No file info available", color = TextTertiary, fontSize = 12.sp, modifier = Modifier.padding(4.dp))
                 } else {
-                    Text("Files (${item.files.size})", color = TextSecondary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                    Spacer(modifier = Modifier.height(8.dp))
-                    val displayFiles = item.files.take(15)
-                    displayFiles.forEach { file ->
-                        TorrentFileRow(file = file, onToggle = { onToggleFile(file.index) })
-                        Spacer(modifier = Modifier.height(4.dp))
+                    // Header row
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            val allSelected = selectedIndices.size == displayFiles.size
+                            Checkbox(
+                                checked = allSelected,
+                                onCheckedChange = {
+                                    selectedIndices = if (allSelected) emptySet()
+                                    else displayFiles.map { it.index }.toSet()
+                                },
+                                colors = CheckboxDefaults.colors(
+                                    checkedColor = Violet,
+                                    uncheckedColor = TextTertiary,
+                                    checkmarkColor = TextPrimary
+                                ),
+                                modifier = Modifier.size(24.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                "Files (${displayFiles.size})",
+                                color = TextSecondary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                        if (selectedIndices.isNotEmpty()) {
+                            TextButton(
+                                onClick = {
+                                    vm.deleteSelectedFiles(item.infoHash, selectedIndices)
+                                    selectedIndices = emptySet()
+                                }
+                            ) {
+                                Icon(Icons.Outlined.Delete, null, tint = Rose, modifier = Modifier.size(14.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Delete (${selectedIndices.size})", color = Rose, fontSize = 11.sp)
+                            }
+                        }
                     }
-                    if (item.files.size > 15) {
-                        Text("…and ${item.files.size - 15} more files", color = TextTertiary, fontSize = 11.sp,
-                            modifier = Modifier.padding(start = 4.dp, top = 4.dp))
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    displayFiles.forEach { file ->
+                        TorrentFileRow(
+                            file = file,
+                            isSelected = file.index in selectedIndices,
+                            selectionMode = selectedIndices.isNotEmpty(),
+                            onSelect = {
+                                selectedIndices = if (file.index in selectedIndices)
+                                    selectedIndices - file.index
+                                else
+                                    selectedIndices + file.index
+                            },
+                            onToggle = { onToggleFile(file.index) }
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
                     }
                 }
             }
@@ -1114,7 +1301,14 @@ private fun TorrentExpandedPanel(
             if (item.state == TorrentState.DOWNLOADING || item.state == TorrentState.METADATA || item.state == TorrentState.CHECKING || item.state == TorrentState.SEEDING) {
                 TorrentActionButton(Icons.Outlined.Pause, "Pause", Amber, onPause, Modifier.weight(1f))
             } else if (item.state == TorrentState.PAUSED || item.state == TorrentState.STOPPED) {
-                TorrentActionButton(Icons.Outlined.PlayArrow, "Resume", Emerald, onResume, Modifier.weight(1f))
+                val isCompleted = item.infoHash in vm.autoPausedForSeeding
+                TorrentActionButton(
+                    icon = if (isCompleted) Icons.Outlined.CloudUpload else Icons.Outlined.PlayArrow,
+                    label = if (isCompleted) "Seed" else "Resume",
+                    color = if (isCompleted) Cyan else Emerald,
+                    onClick = onResume,
+                    modifier = Modifier.weight(1f)
+                )
             }
 
             if (item.state == TorrentState.FINISHED || item.state == TorrentState.SEEDING) {
@@ -1226,8 +1420,15 @@ private fun PeerRow(p: PeerInfo) {
 // TORRENT FILE ROW — with selection checkbox
 // ══════════════════════════════════════════════════════════════════════════════════
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun TorrentFileRow(file: TorrentFileInfo, onToggle: () -> Unit) {
+private fun TorrentFileRow(
+    file: TorrentFileInfo,
+    isSelected: Boolean,
+    selectionMode: Boolean,
+    onSelect: () -> Unit,
+    onToggle: () -> Unit
+) {
     val isEnabled = file.priority > 0
     val ext = file.name.substringAfterLast('.', "").lowercase()
 
@@ -1250,28 +1451,60 @@ private fun TorrentFileRow(file: TorrentFileInfo, onToggle: () -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(8.dp))
-            .background(Ink2.copy(alpha = 0.4f))
-            .clickable { onToggle() }
+            .background(
+                if (isSelected) Violet.copy(alpha = 0.1f) else Ink2.copy(alpha = 0.4f)
+            )
+            .combinedClickable(
+                onClick = { if (selectionMode) onSelect() else onToggle() },
+                onLongClick = { if (!selectionMode) onSelect() }
+            )
             .padding(horizontal = 6.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Checkbox(
-            checked = isEnabled,
-            onCheckedChange = { onToggle() },
-            colors = CheckboxDefaults.colors(
-                checkedColor = Emerald,
-                uncheckedColor = TextTertiary,
-                checkmarkColor = TextPrimary
-            ),
-            modifier = Modifier.size(24.dp)
-        )
+        if (selectionMode) {
+            // In selection mode — checkbox tracks selection
+            Checkbox(
+                checked = isSelected,
+                onCheckedChange = { onSelect() },
+                colors = CheckboxDefaults.colors(
+                    checkedColor = Violet,
+                    uncheckedColor = TextTertiary,
+                    checkmarkColor = TextPrimary
+                ),
+                modifier = Modifier.size(24.dp)
+            )
+        } else {
+            // Normal mode — small radio-style dot = file included/excluded in download
+            Box(
+                modifier = Modifier
+                    .size(22.dp)
+                    .clip(CircleShape)
+                    .border(
+                        1.5.dp,
+                        if (isEnabled) Emerald.copy(alpha = 0.6f) else TextTertiary.copy(alpha = 0.3f),
+                        CircleShape
+                    )
+                    .background(if (isEnabled) Emerald.copy(alpha = 0.1f) else Color.Transparent)
+                    .clickable { onToggle() },
+                contentAlignment = Alignment.Center
+            ) {
+                if (isEnabled) {
+                    Box(
+                        modifier = Modifier
+                            .size(10.dp)
+                            .clip(CircleShape)
+                            .background(Emerald)
+                    )
+                }
+            }
+        }
         Spacer(modifier = Modifier.width(6.dp))
-        Icon(fileIcon, null, tint = if (isEnabled) fileColor else TextTertiary.copy(alpha = 0.4f), modifier = Modifier.size(16.dp))
+        Icon(fileIcon, null, tint = if (isEnabled || isSelected) fileColor else TextTertiary.copy(alpha = 0.4f), modifier = Modifier.size(16.dp))
         Spacer(modifier = Modifier.width(8.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 file.name,
-                color = if (isEnabled) TextPrimary else TextTertiary,
+                color = if (isEnabled || isSelected) TextPrimary else TextTertiary,
                 fontSize = 12.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
@@ -1298,6 +1531,7 @@ private fun TorrentSettingsSheet(
     onDismiss: () -> Unit,
     onSave: (TorrentPrefs) -> Unit
 ) {
+    val context = LocalContext.current
     var dlLimit by remember { mutableStateOf(if (settings.downloadSpeedLimit > 0) (settings.downloadSpeedLimit / 1024).toString() else "") }
     var ulLimit by remember { mutableStateOf(if (settings.uploadSpeedLimit > 0) (settings.uploadSpeedLimit / 1024).toString() else "") }
     var wifiOnly by remember { mutableStateOf(settings.wifiOnly) }
@@ -1305,6 +1539,18 @@ private fun TorrentSettingsSheet(
     var notifications by remember { mutableStateOf(settings.showNotifications) }
     var autoQueue by remember { mutableStateOf(settings.autoQueueOnLowRam) }
     var maxDl by remember { mutableStateOf(settings.maxActiveDownloads.toString()) }
+    var pickedPath by remember { mutableStateOf(settings.savePath) }
+    var stopSeedingOnComplete by remember { mutableStateOf(settings.stopSeedingOnComplete) }
+    var maxSeedRatioStr by remember { mutableStateOf(if (settings.maxSeedRatio > 0f) "%.2f".format(settings.maxSeedRatio) else "") }
+
+    val folderLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            val path = treeUriToPath(context, uri)
+            if (path != null) pickedPath = path
+        }
+    }
 
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
@@ -1381,6 +1627,111 @@ private fun TorrentSettingsSheet(
             SettingsToggle("Notifications", "Show download progress in notifications", notifications, Icons.Outlined.Notifications) { notifications = it }
             SettingsToggle("Auto-Pause Low RAM", "Pause downloads when memory is low", autoQueue, Icons.Outlined.Memory) { autoQueue = it }
 
+            Spacer(modifier = Modifier.height(20.dp))
+
+            // ── Storage Path ──
+            Text("STORAGE", color = TextTertiary, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.8.sp)
+            Spacer(modifier = Modifier.height(10.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Ink3)
+                    .border(1.dp, SurfaceBorder.copy(alpha = 0.3f), RoundedCornerShape(12.dp))
+                    .clickable { folderLauncher.launch(null) }
+                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Outlined.FolderOpen, null, tint = VioletLight, modifier = Modifier.size(20.dp))
+                Spacer(modifier = Modifier.width(10.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Download Folder", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                    Text(
+                        pickedPath.ifBlank { "Downloads/MediaDL/Torrents (default)" }
+                            .replace("/storage/emulated/0/", ""),
+                        color = TextTertiary, fontSize = 11.sp,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Icon(Icons.Outlined.ChevronRight, null, tint = TextTertiary, modifier = Modifier.size(18.dp))
+            }
+            if (pickedPath.isNotBlank()) {
+                TextButton(
+                    onClick = { pickedPath = "" },
+                    contentPadding = PaddingValues(horizontal = 0.dp, vertical = 2.dp)
+                ) {
+                    Text("Reset to default", color = TextTertiary, fontSize = 11.sp)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(20.dp))
+
+            // ── Seeding ──
+            Text("SEEDING", color = TextTertiary, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.8.sp)
+            Spacer(modifier = Modifier.height(10.dp))
+            SettingsToggle(
+                title = "Stop seeding when download finishes",
+                subtitle = "Pause automatically once 100% is reached",
+                checked = stopSeedingOnComplete,
+                icon = Icons.Outlined.CloudOff
+            ) { stopSeedingOnComplete = it }
+            Spacer(modifier = Modifier.height(8.dp))
+            SettingsTextField(
+                label = "Max seed ratio (0 = unlimited)",
+                value = maxSeedRatioStr,
+                onValueChange = { v ->
+                    val filtered = v.filter { it.isDigit() || it == '.' }
+                    maxSeedRatioStr = filtered
+                },
+                placeholder = "e.g. 1.0",
+                modifier = Modifier.fillMaxWidth()
+            )
+            Text("Stop seeding when upload÷download reaches this ratio", color = TextTertiary, fontSize = 11.sp)
+
+            Spacer(modifier = Modifier.height(20.dp))
+
+            // ── Background ──
+            Text("BACKGROUND", color = TextTertiary, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.8.sp)
+            Spacer(modifier = Modifier.height(10.dp))
+            val pm = remember { context.getSystemService(Context.POWER_SERVICE) as PowerManager }
+            val isBatteryExempt = remember { pm.isIgnoringBatteryOptimizations(context.packageName) }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(Ink3)
+                    .border(1.dp, SurfaceBorder.copy(alpha = 0.3f), RoundedCornerShape(12.dp))
+                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    if (isBatteryExempt) Icons.Outlined.BatteryChargingFull else Icons.Outlined.BatteryAlert,
+                    null,
+                    tint = if (isBatteryExempt) Emerald else Amber,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Background service", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                    Text(
+                        if (isBatteryExempt) "App is exempt from battery optimization" else "Battery optimization may stop torrents",
+                        color = if (isBatteryExempt) Emerald else Amber,
+                        fontSize = 11.sp
+                    )
+                }
+                if (!isBatteryExempt) {
+                    TextButton(onClick = {
+                        val intent = Intent(
+                            android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                            Uri.parse("package:${context.packageName}")
+                        )
+                        context.startActivity(intent)
+                    }) {
+                        Text("Allow", color = Amber, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    }
+                }
+            }
+
             Spacer(modifier = Modifier.height(24.dp))
 
             // ── Save button ──
@@ -1389,6 +1740,7 @@ private fun TorrentSettingsSheet(
                     val dlBytes = dlLimit.toIntOrNull()?.let { it * 1024 } ?: 0
                     val ulBytes = ulLimit.toIntOrNull()?.let { it * 1024 } ?: 0
                     val maxActive = maxDl.toIntOrNull()?.coerceIn(1, 20) ?: 5
+                    val seedRatio = maxSeedRatioStr.toFloatOrNull()?.coerceAtLeast(0f) ?: 0f
                     onSave(
                         settings.copy(
                             downloadSpeedLimit = dlBytes,
@@ -1397,7 +1749,10 @@ private fun TorrentSettingsSheet(
                             sequentialByDefault = sequential,
                             showNotifications = notifications,
                             autoQueueOnLowRam = autoQueue,
-                            maxActiveDownloads = maxActive
+                            maxActiveDownloads = maxActive,
+                            savePath = pickedPath,
+                            stopSeedingOnComplete = stopSeedingOnComplete,
+                            maxSeedRatio = seedRatio
                         )
                     )
                 },
@@ -1486,7 +1841,9 @@ private fun AnimatedBanner(
     text: String,
     color: Color,
     icon: ImageVector,
-    onDismiss: (() -> Unit)?
+    onDismiss: (() -> Unit)?,
+    actionLabel: String? = null,
+    onAction: (() -> Unit)? = null
 ) {
     AnimatedVisibility(
         visible = visible,
@@ -1507,8 +1864,16 @@ private fun AnimatedBanner(
             Icon(icon, null, tint = color, modifier = Modifier.size(18.dp))
             Spacer(modifier = Modifier.width(10.dp))
             Text(text, color = color.copy(alpha = 0.9f), fontSize = 13.sp, modifier = Modifier.weight(1f))
-            if (onDismiss != null) {
+            if (actionLabel != null && onAction != null) {
                 Spacer(modifier = Modifier.width(8.dp))
+                TextButton(
+                    onClick = onAction,
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                ) {
+                    Text(actionLabel, color = color, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+            if (onDismiss != null) {
                 IconButton(onClick = onDismiss, modifier = Modifier.size(24.dp)) {
                     Icon(Icons.Outlined.Close, "Dismiss", tint = color.copy(alpha = 0.6f), modifier = Modifier.size(16.dp))
                 }
@@ -1525,19 +1890,16 @@ private fun TorrentActionButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    Row(
+    Box(
         modifier = modifier
             .clip(RoundedCornerShape(10.dp))
             .background(color.copy(alpha = 0.08f))
             .border(1.dp, color.copy(alpha = 0.15f), RoundedCornerShape(10.dp))
             .clickable { onClick() }
-            .padding(horizontal = 10.dp, vertical = 10.dp),
-        horizontalArrangement = Arrangement.Center,
-        verticalAlignment = Alignment.CenterVertically
+            .padding(vertical = 12.dp),
+        contentAlignment = Alignment.Center
     ) {
-        Icon(icon, label, tint = color, modifier = Modifier.size(15.dp))
-        Spacer(modifier = Modifier.width(4.dp))
-        Text(label, color = color, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+        Icon(icon, label, tint = color, modifier = Modifier.size(20.dp))
     }
 }
 

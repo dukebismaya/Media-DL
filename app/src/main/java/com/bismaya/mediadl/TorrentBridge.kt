@@ -89,6 +89,30 @@ object TorrentBridge {
     fun makeInfoSync(torrentId: String): TorrentInfo? =
         engine.makeInfoSync(torrentId)
 
+    /**
+     * Returns the full file list for a torrent by reading its metadata.
+     * Falls back to an empty list if metadata is not yet available.
+     * Must be called from a background thread.
+     */
+    fun getFilesForTorrent(id: String): List<TorrentFileInfo> {
+        val meta = engine.getTorrentMetaInfo(id) ?: return emptyList()
+        val priorities = engine.makeInfoSync(id)?.filePriorities ?: emptyArray()
+        val received  = engine.makeAdvancedInfoSync(id)?.filesReceivedBytes ?: LongArray(0)
+        return meta.fileList.map { f ->
+            val idx      = f.index
+            val priority = priorities.getOrNull(idx)?.value() ?: 4
+            val rx       = received.getOrElse(idx) { 0L }
+            val progress = if (f.size > 0) (rx.toFloat() / f.size).coerceIn(0f, 1f) else 1f
+            TorrentFileInfo(
+                index    = idx,
+                name     = f.path.substringAfterLast('/').ifBlank { f.path },
+                size     = f.size,
+                progress = progress,
+                priority = priority
+            )
+        }
+    }
+
     // ── Add torrent ────────────────────────────────────────────────────────────
 
     /**

@@ -31,7 +31,9 @@ data class TorrentPrefs(
     val maxActiveSeeds: Int = 3,
     val showNotifications: Boolean = true,
     val autoQueueOnLowRam: Boolean = true,
-    val savePath: String = ""               // empty = default (Downloads/MediaDL/Torrents)
+    val savePath: String = "",              // empty = default (Downloads/MediaDL/Torrents)
+    val stopSeedingOnComplete: Boolean = false, // auto-pause when download finishes
+    val maxSeedRatio: Float = 0f            // 0 = seed forever; e.g. 1.0 = 1:1 ratio
 )
 
 object TorrentSettingsManager {
@@ -51,7 +53,9 @@ object TorrentSettingsManager {
             maxActiveSeeds = p.getInt("max_active_seeds", 3),
             showNotifications = p.getBoolean("notifications", true),
             autoQueueOnLowRam = p.getBoolean("auto_queue_ram", true),
-            savePath = p.getString("save_path", "") ?: ""
+            savePath = p.getString("save_path", "") ?: "",
+            stopSeedingOnComplete = p.getBoolean("stop_seeding_complete", false),
+            maxSeedRatio = p.getFloat("max_seed_ratio", 0f)
         )
     }
 
@@ -66,6 +70,8 @@ object TorrentSettingsManager {
             putBoolean("notifications", settings.showNotifications)
             putBoolean("auto_queue_ram", settings.autoQueueOnLowRam)
             putString("save_path", settings.savePath)
+            putBoolean("stop_seeding_complete", settings.stopSeedingOnComplete)
+            putFloat("max_seed_ratio", settings.maxSeedRatio)
         }.apply()
     }
 
