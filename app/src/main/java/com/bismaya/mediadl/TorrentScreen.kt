@@ -365,6 +365,7 @@ private fun ActiveTabContent(vm: TorrentViewModel, onPickFile: () -> Unit) {
                 onToggleFile = { idx -> vm.toggleFileDownload(torrent.infoHash, idx) },
                 onShare = { vm.shareMagnet(context, torrent.infoHash) },
                 onOpen = { vm.openFile(context, torrent) },
+                vm = vm,
                 modifier = Modifier.padding(horizontal = 20.dp).padding(bottom = 12.dp)
             )
         }
@@ -690,6 +691,7 @@ private fun TorrentCard(
     onToggleFile: (Int) -> Unit,
     onShare: () -> Unit,
     onOpen: () -> Unit,
+    vm: TorrentViewModel,
     modifier: Modifier = Modifier
 ) {
     val stateColor = when (item.state) {
@@ -698,7 +700,9 @@ private fun TorrentCard(
         TorrentState.PAUSED -> Amber
         TorrentState.ERROR -> Rose
         TorrentState.CHECKING -> VioletLight
+        TorrentState.MOVING -> Amber
         TorrentState.QUEUED -> TextTertiary
+        TorrentState.STOPPED, TorrentState.UNKNOWN -> TextTertiary
     }
 
     val stateLabel = when (item.state) {
@@ -710,6 +714,9 @@ private fun TorrentCard(
         TorrentState.ERROR -> "Error"
         TorrentState.CHECKING -> "Checking"
         TorrentState.QUEUED -> "Queued"
+        TorrentState.MOVING -> "Moving…"
+        TorrentState.STOPPED -> "Stopped"
+        TorrentState.UNKNOWN -> "Unknown"
     }
 
     Card(
@@ -733,6 +740,10 @@ private fun TorrentCard(
                             TorrentState.FINISHED, TorrentState.SEEDING -> Icons.Outlined.CheckCircle
                             TorrentState.PAUSED -> Icons.Outlined.PauseCircle
                             TorrentState.ERROR -> Icons.Outlined.ErrorOutline
+                            TorrentState.CHECKING -> Icons.Outlined.Refresh
+                            TorrentState.MOVING -> Icons.Outlined.Autorenew
+                            TorrentState.QUEUED -> Icons.Outlined.Schedule
+                            TorrentState.STOPPED, TorrentState.UNKNOWN -> Icons.Outlined.Block
                             else -> Icons.Outlined.Downloading
                         },
                         contentDescription = null, tint = stateColor, modifier = Modifier.size(22.dp)
@@ -772,120 +783,441 @@ private fun TorrentCard(
             }
 
             // ── Progress bar ──
-            if (item.state == TorrentState.DOWNLOADING || item.state == TorrentState.CHECKING || item.state == TorrentState.METADATA) {
+            val showProgress = item.state == TorrentState.DOWNLOADING ||
+                    item.state == TorrentState.CHECKING ||
+                    item.state == TorrentState.METADATA ||
+                    item.state == TorrentState.SEEDING ||
+                    item.state == TorrentState.FINISHED
+            if (showProgress) {
                 Spacer(modifier = Modifier.height(12.dp))
+                val animatedProgress by animateFloatAsState(item.progress, tween(500), label = "torrentProgress")
+                // Speed row
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     Text("${"%.1f".format(item.progress * 100)}%", color = stateColor, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                    Text("${formatSpeed(item.downloadSpeed)}/s ↓  ${formatSpeed(item.uploadSpeed)}/s ↑", color = TextTertiary, fontSize = 11.sp)
+                    if (item.state == TorrentState.SEEDING || item.state == TorrentState.FINISHED) {
+                        val ratio = if (item.shareRatio > 0) "%.2f".format(item.shareRatio) else "0.00"
+                        Text("↑ ${formatSpeed(item.uploadSpeed)}/s  ⋄$ratio", color = Emerald, fontSize = 11.sp)
+                    } else {
+                        Text("${formatSpeed(item.downloadSpeed)}/s ↓  ${formatSpeed(item.uploadSpeed)}/s ↑", color = TextTertiary, fontSize = 11.sp)
+                    }
                 }
                 Spacer(modifier = Modifier.height(6.dp))
-                val animatedProgress by animateFloatAsState(item.progress, tween(500), label = "torrentProgress")
                 Box(modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)).background(stateColor.copy(alpha = 0.08f))) {
                     Box(modifier = Modifier.fillMaxHeight().fillMaxWidth(animatedProgress.coerceIn(0f, 1f)).clip(RoundedCornerShape(3.dp)).background(stateColor))
                 }
                 Spacer(modifier = Modifier.height(6.dp))
-                Row {
-                    Text("${item.seeders} seeders · ${item.peers} peers", color = TextTertiary, fontSize = 11.sp)
-                    Spacer(modifier = Modifier.weight(1f))
-                    Text("${formatBytes(item.downloadedBytes)} / ${formatBytes(item.totalSize)}", color = TextTertiary, fontSize = 11.sp)
+                // seeds·peers row / ETA
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (item.state == TorrentState.SEEDING || item.state == TorrentState.FINISHED) {
+                        val seedText = if (item.totalSeeds > 0) "${item.connectedSeeds}(${item.totalSeeds})" else "${item.seeders}"
+                        val peerText = if (item.totalPeers > 0) "${item.connectedPeers}(${item.totalPeers})" else "${item.peers}"
+                        Text("🌱 $seedText  📤 ${formatBytes(item.totalSentBytes)}", color = TextTertiary, fontSize = 11.sp)
+                        Spacer(modifier = Modifier.weight(1f))
+                        Text(peerText + " peers", color = TextTertiary, fontSize = 11.sp)
+                    } else {
+                        val seedText = if (item.totalSeeds > 0) "${item.connectedSeeds}(${item.totalSeeds})" else "${item.seeders}"
+                        val peerText = if (item.totalPeers > 0) "${item.connectedPeers}(${item.totalPeers})" else "${item.peers}"
+                        Text("🌱 $seedText · 👥 $peerText", color = TextTertiary, fontSize = 11.sp)
+                        Spacer(modifier = Modifier.weight(1f))
+                        if (item.etaSec < Long.MAX_VALUE && item.etaSec >= 0) {
+                            Text("ETA ${formatEta(item.etaSec)}", color = TextTertiary, fontSize = 11.sp)
+                        } else {
+                            Text("${formatBytes(item.downloadedBytes)} / ${formatBytes(item.totalSize)}", color = TextTertiary, fontSize = 11.sp)
+                        }
+                    }
                 }
             }
 
             // ── Expanded content ──
             AnimatedVisibility(isExpanded, enter = fadeIn(tween(200)) + expandVertically(tween(250)), exit = fadeOut(tween(150)) + shrinkVertically(tween(200))) {
-                Column {
-                    Spacer(modifier = Modifier.height(12.dp))
-                    HorizontalDivider(color = SurfaceBorder.copy(alpha = 0.1f))
-                    Spacer(modifier = Modifier.height(12.dp))
+                TorrentExpandedPanel(
+                    item = item,
+                    onPause = onPause,
+                    onResume = onResume,
+                    onDelete = onDelete,
+                    onToggleSequential = onToggleSequential,
+                    onToggleFile = onToggleFile,
+                    onShare = onShare,
+                    onOpen = onOpen,
+                    vm = vm
+                )
+            }
+        }
+    }
+}
 
-                    // ── Sequential toggle ──
+// ══════════════════════════════════════════════════════════════════════════════════
+// ETA formatter
+// ══════════════════════════════════════════════════════════════════════════════════
+
+internal fun formatEta(seconds: Long): String {
+    if (seconds <= 0) return "0s"
+    val d = seconds / 86400
+    val h = (seconds % 86400) / 3600
+    val m = (seconds % 3600) / 60
+    val s = seconds % 60
+    return when {
+        d > 0  -> "${d}d ${h}h"
+        h > 0  -> "${h}h ${m}m"
+        m > 0  -> "${m}m ${s}s"
+        else   -> "${s}s"
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════
+// TORRENT EXPANDED PANEL — libretorrent-style Info/Trackers/Peers tabs
+// ══════════════════════════════════════════════════════════════════════════════════
+
+@Composable
+private fun TorrentExpandedPanel(
+    item: TorrentItem,
+    onPause: () -> Unit,
+    onResume: () -> Unit,
+    onDelete: () -> Unit,
+    onToggleSequential: () -> Unit,
+    onToggleFile: (Int) -> Unit,
+    onShare: () -> Unit,
+    onOpen: () -> Unit,
+    vm: TorrentViewModel
+) {
+    // tab selection: 0=Info, 1=Files, 2=Trackers, 3=Peers
+    var selectedTab by remember { mutableIntStateOf(0) }
+    val tabs = listOf("Info", "Files", "Trackers", "Peers")
+
+    // lazy-loaded lists (refresh on tab switch)
+    var trackers by remember { mutableStateOf<List<TrackerInfo>>(emptyList()) }
+    var peers    by remember { mutableStateOf<List<PeerInfo>>(emptyList()) }
+
+    LaunchedEffect(selectedTab, item.infoHash) {
+        when (selectedTab) {
+            2 -> trackers = vm.getTrackerList(item.infoHash)
+            3 -> peers    = vm.getPeerList(item.infoHash)
+        }
+    }
+
+    Column {
+        Spacer(modifier = Modifier.height(12.dp))
+        HorizontalDivider(color = SurfaceBorder.copy(alpha = 0.1f))
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // ── Tab chips ──
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            tabs.forEachIndexed { idx, label ->
+                val active = idx == selectedTab
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(if (active) Cyan.copy(alpha = 0.15f) else Ink2.copy(alpha = 0.5f))
+                        .clickable { selectedTab = idx }
+                        .padding(horizontal = 14.dp, vertical = 6.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        label,
+                        color = if (active) Cyan else TextTertiary,
+                        fontSize = 12.sp,
+                        fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        when (selectedTab) {
+            // ── INFO tab ──
+            0 -> {
+                // Sequential toggle
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Ink2.copy(alpha = 0.5f))
+                        .clickable { onToggleSequential() }
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Outlined.Sort, null, tint = Amber, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Sequential Download", color = TextSecondary, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                    Switch(
+                        checked = item.isSequential,
+                        onCheckedChange = { onToggleSequential() },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Amber,
+                            checkedTrackColor = Amber.copy(alpha = 0.3f),
+                            uncheckedThumbColor = TextTertiary,
+                            uncheckedTrackColor = Ink3
+                        ),
+                        modifier = Modifier.height(24.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Stat rows
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(Ink2.copy(alpha = 0.5f))
+                        .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    // Download/Upload
+                    TorrentInfoRow(Icons.Outlined.Speed, "Speed",
+                        "↓ ${formatSpeed(item.downloadSpeed)}/s  ↑ ${formatSpeed(item.uploadSpeed)}/s")
+
+                    if (item.downloadSpeedLimit > 0 || item.uploadSpeedLimit > 0) {
+                        TorrentInfoRow(Icons.Outlined.Tune, "Limits",
+                            "↓ ${if (item.downloadSpeedLimit > 0) formatSpeed(item.downloadSpeedLimit.toLong()) else "∞"}/s  " +
+                            "↑ ${if (item.uploadSpeedLimit > 0) formatSpeed(item.uploadSpeedLimit.toLong()) else "∞"}/s")
+                    }
+
+                    // ETA
+                    if (item.etaSec < Long.MAX_VALUE && item.etaSec >= 0 && item.state == TorrentState.DOWNLOADING) {
+                        TorrentInfoRow(Icons.Outlined.Schedule, "ETA", formatEta(item.etaSec))
+                    }
+
+                    // Seeds / Peers
+                    val seedLabel = if (item.totalSeeds > 0) "${item.connectedSeeds} of ${item.totalSeeds}" else "${item.seeders}"
+                    val peerLabel = if (item.totalPeers > 0) "${item.connectedPeers} of ${item.totalPeers}" else "${item.peers}"
+                    TorrentInfoRow(Icons.Outlined.Group, "Seeds / Peers", "$seedLabel  ·  $peerLabel")
+
+                    // Downloaded / Uploaded
+                    TorrentInfoRow(Icons.Outlined.Download, "Downloaded", formatBytes(item.downloadedBytes) + " of " + formatBytes(item.totalSize))
+                    if (item.totalSentBytes > 0) {
+                        TorrentInfoRow(Icons.Outlined.Upload, "Uploaded", formatBytes(item.totalSentBytes))
+                    }
+
+                    // Share ratio
+                    val ratioText = "%.3f".format(item.shareRatio)
+                    TorrentInfoRow(Icons.Outlined.SwapVert, "Share Ratio", ratioText)
+
+                    // Active / Seeding time
+                    if (item.activeTimeSec > 0) {
+                        TorrentInfoRow(Icons.Outlined.Timer, "Active Time", formatEta(item.activeTimeSec))
+                    }
+                    if (item.seedingTimeSec > 0) {
+                        TorrentInfoRow(Icons.Outlined.CloudUpload, "Seeding Time", formatEta(item.seedingTimeSec))
+                    }
+
+                    // Save path
+                    if (item.savePath.isNotBlank()) {
+                        TorrentInfoRow(Icons.Outlined.FolderOpen, "Save Path", item.savePath)
+                    }
+
+                    // Info hash
+                    if (item.infoHash.isNotBlank()) {
+                        TorrentInfoRow(Icons.Outlined.Tag, "Info Hash", item.infoHash)
+                    }
+                }
+
+                // Error
+                if (item.error != null) {
+                    Spacer(modifier = Modifier.height(8.dp))
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(Ink2.copy(alpha = 0.5f))
-                            .clickable { onToggleSequential() }
-                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(Rose.copy(alpha = 0.06f)).padding(10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(Icons.Outlined.Sort, null, tint = Amber, modifier = Modifier.size(16.dp))
+                        Icon(Icons.Outlined.ErrorOutline, null, tint = Rose, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Sequential Download", color = TextSecondary, fontSize = 13.sp, modifier = Modifier.weight(1f))
-                        Switch(
-                            checked = item.isSequential,
-                            onCheckedChange = { onToggleSequential() },
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = Amber,
-                                checkedTrackColor = Amber.copy(alpha = 0.3f),
-                                uncheckedThumbColor = TextTertiary,
-                                uncheckedTrackColor = Ink3
-                            ),
-                            modifier = Modifier.height(24.dp)
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(10.dp))
-
-                    // ── File list with selection ──
-                    if (item.files.isNotEmpty()) {
-                        Text("Files (${item.files.size})", color = TextSecondary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                        Spacer(modifier = Modifier.height(8.dp))
-                        val displayFiles = item.files.take(15)
-                        displayFiles.forEach { file ->
-                            TorrentFileRow(file = file, onToggle = { onToggleFile(file.index) })
-                            Spacer(modifier = Modifier.height(4.dp))
-                        }
-                        if (item.files.size > 15) {
-                            Text("…and ${item.files.size - 15} more files", color = TextTertiary, fontSize = 11.sp, modifier = Modifier.padding(start = 4.dp, top = 4.dp))
-                        }
-                        Spacer(modifier = Modifier.height(12.dp))
-                    }
-
-                    // ── Error detail ──
-                    if (item.error != null) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(Rose.copy(alpha = 0.06f)).padding(10.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(Icons.Outlined.ErrorOutline, null, tint = Rose, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(item.error, color = Rose.copy(alpha = 0.85f), fontSize = 12.sp)
-                        }
-                        Spacer(modifier = Modifier.height(12.dp))
-                    }
-
-                    // ── Save path ──
-                    if (item.savePath.isNotBlank()) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Outlined.FolderOpen, null, tint = TextTertiary, modifier = Modifier.size(13.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(item.savePath, color = TextTertiary, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        }
-                        Spacer(modifier = Modifier.height(12.dp))
-                    }
-
-                    // ── Action buttons ──
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        // Pause/Resume
-                        if (item.state == TorrentState.DOWNLOADING || item.state == TorrentState.METADATA || item.state == TorrentState.CHECKING) {
-                            TorrentActionButton(Icons.Outlined.Pause, "Pause", Amber, onPause, Modifier.weight(1f))
-                        } else if (item.state == TorrentState.PAUSED) {
-                            TorrentActionButton(Icons.Outlined.PlayArrow, "Resume", Emerald, onResume, Modifier.weight(1f))
-                        }
-
-                        // Open (completed only)
-                        if (item.state == TorrentState.FINISHED || item.state == TorrentState.SEEDING) {
-                            TorrentActionButton(Icons.Outlined.OpenInNew, "Open", Cyan, onOpen, Modifier.weight(1f))
-                        }
-
-                        // Share
-                        TorrentActionButton(Icons.Outlined.Share, "Share", VioletLight, onShare, Modifier.weight(1f))
-
-                        // Delete
-                        TorrentActionButton(Icons.Outlined.Delete, "Remove", Rose, onDelete, Modifier.weight(1f))
+                        Text(item.error, color = Rose.copy(alpha = 0.85f), fontSize = 12.sp)
                     }
                 }
             }
+
+            // ── FILES tab ──
+            1 -> {
+                if (item.files.isEmpty()) {
+                    Text("No file info available", color = TextTertiary, fontSize = 12.sp, modifier = Modifier.padding(4.dp))
+                } else {
+                    Text("Files (${item.files.size})", color = TextSecondary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    val displayFiles = item.files.take(15)
+                    displayFiles.forEach { file ->
+                        TorrentFileRow(file = file, onToggle = { onToggleFile(file.index) })
+                        Spacer(modifier = Modifier.height(4.dp))
+                    }
+                    if (item.files.size > 15) {
+                        Text("…and ${item.files.size - 15} more files", color = TextTertiary, fontSize = 11.sp,
+                            modifier = Modifier.padding(start = 4.dp, top = 4.dp))
+                    }
+                }
+            }
+
+            // ── TRACKERS tab ──
+            2 -> {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Trackers (${trackers.size})", color = TextSecondary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    TextButton(onClick = {
+                        vm.requestTrackerAnnounce(item.infoHash)
+                        trackers = vm.getTrackerList(item.infoHash)
+                    }) {
+                        Icon(Icons.Outlined.Refresh, null, tint = Cyan, modifier = Modifier.size(14.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Announce All", color = Cyan, fontSize = 11.sp)
+                    }
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+                if (trackers.isEmpty()) {
+                    Text("No trackers found", color = TextTertiary, fontSize = 12.sp, modifier = Modifier.padding(4.dp))
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        trackers.forEach { t -> TrackerRow(t) }
+                    }
+                }
+            }
+
+            // ── PEERS tab ──
+            3 -> {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Peers (${peers.size})", color = TextSecondary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    TextButton(onClick = { peers = vm.getPeerList(item.infoHash) }) {
+                        Icon(Icons.Outlined.Refresh, null, tint = Cyan, modifier = Modifier.size(14.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Refresh", color = Cyan, fontSize = 11.sp)
+                    }
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+                if (peers.isEmpty()) {
+                    Text("No peers connected", color = TextTertiary, fontSize = 12.sp, modifier = Modifier.padding(4.dp))
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        peers.take(20).forEach { p -> PeerRow(p) }
+                        if (peers.size > 20) {
+                            Text("…and ${peers.size - 20} more peers", color = TextTertiary, fontSize = 11.sp,
+                                modifier = Modifier.padding(top = 4.dp))
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // ── Action buttons ──
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (item.state == TorrentState.DOWNLOADING || item.state == TorrentState.METADATA || item.state == TorrentState.CHECKING || item.state == TorrentState.SEEDING) {
+                TorrentActionButton(Icons.Outlined.Pause, "Pause", Amber, onPause, Modifier.weight(1f))
+            } else if (item.state == TorrentState.PAUSED || item.state == TorrentState.STOPPED) {
+                TorrentActionButton(Icons.Outlined.PlayArrow, "Resume", Emerald, onResume, Modifier.weight(1f))
+            }
+
+            if (item.state == TorrentState.FINISHED || item.state == TorrentState.SEEDING) {
+                TorrentActionButton(Icons.Outlined.OpenInNew, "Open", Cyan, onOpen, Modifier.weight(1f))
+            }
+
+            TorrentActionButton(Icons.Outlined.FindReplace, "Recheck", VioletLight, { vm.forceRecheck(item.infoHash) }, Modifier.weight(1f))
+            TorrentActionButton(Icons.Outlined.Share, "Share", Cyan, onShare, Modifier.weight(1f))
+            TorrentActionButton(Icons.Outlined.Delete, "Remove", Rose, onDelete, Modifier.weight(1f))
+        }
+    }
+}
+
+// ── Single info row inside the Info tab ──────────────────────────────────────────
+
+@Composable
+private fun TorrentInfoRow(icon: ImageVector, label: String, value: String) {
+    Row(verticalAlignment = Alignment.Top) {
+        Icon(icon, null, tint = TextTertiary, modifier = Modifier.size(14.dp).padding(top = 1.dp))
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(label, color = TextTertiary, fontSize = 11.sp, modifier = Modifier.width(82.dp))
+        Text(value, color = TextSecondary, fontSize = 11.sp, modifier = Modifier.weight(1f))
+    }
+}
+
+// ── Tracker row ──────────────────────────────────────────────────────────────────
+
+@Composable
+private fun TrackerRow(t: TrackerInfo) {
+    val (dotColor, statusText) = when (t.status) {
+        TrackerStatus.WORKING       -> Emerald to "Working"
+        TrackerStatus.UPDATING      -> Amber   to "Updating…"
+        TrackerStatus.NOT_CONTACTED -> TextTertiary to "Not contacted"
+        TrackerStatus.NOT_WORKING   -> Rose    to "Not working"
+        else                        -> TextTertiary to "Unknown"
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(Ink2.copy(alpha = 0.5f))
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.Top
+    ) {
+        Box(
+            modifier = Modifier
+                .padding(top = 3.dp)
+                .size(8.dp)
+                .clip(CircleShape)
+                .background(dotColor)
+        )
+        Spacer(modifier = Modifier.width(10.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(t.url, color = TextSecondary, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (t.message.isNotBlank()) {
+                Text(t.message, color = TextTertiary, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+        }
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(statusText, color = dotColor, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+// ── Peer row ─────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun PeerRow(p: PeerInfo) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(Ink2.copy(alpha = 0.5f))
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(Icons.Outlined.PersonOutline, null, tint = TextTertiary, modifier = Modifier.size(14.dp))
+        Spacer(modifier = Modifier.width(8.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(p.ip, color = TextSecondary, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (p.client.isNotBlank()) {
+                Text(p.client, color = TextTertiary, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+        }
+        Spacer(modifier = Modifier.width(8.dp))
+        Column(horizontalAlignment = Alignment.End) {
+            Text("↓ ${formatSpeed(p.downloadSpeed)}/s", color = Cyan, fontSize = 10.sp)
+            Text("↑ ${formatSpeed(p.uploadSpeed)}/s", color = Emerald, fontSize = 10.sp)
+        }
+        Spacer(modifier = Modifier.width(6.dp))
+        Box(
+            modifier = Modifier
+                .width(36.dp)
+                .height(4.dp)
+                .clip(RoundedCornerShape(2.dp))
+                .background(Ink3)
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxHeight()
+                    .fillMaxWidth(p.progress.coerceIn(0f, 1f))
+                    .clip(RoundedCornerShape(2.dp))
+                    .background(Cyan)
+            )
         }
     }
 }

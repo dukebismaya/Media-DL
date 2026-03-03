@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Boolean resources used by Utils.java screen-size detection helpers.
+    Override these in res/values-sw600dp/ or similar qualifiers for tablets.
+-->
+<resources>
+    <bool name="isTwoPane">false</bool>
+    <bool name="isLargeScreenDevice">false</bool>
+</resources>

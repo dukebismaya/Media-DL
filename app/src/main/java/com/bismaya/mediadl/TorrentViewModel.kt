@@ -4,6 +4,8 @@ import android.app.Application
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Environment
 import android.util.Log
 import androidx.compose.runtime.getValue
@@ -15,7 +17,7 @@ import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -64,27 +66,37 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
     var showSettings by mutableStateOf(false)
 
     // ── File browser state ──
-    private val defaultDir: File get() = TorrentEngine.getActiveSaveDirectory(appContext)
+    private val defaultSaveDir: File
+        get() {
+            val base = if (settings.savePath.isNotBlank()) {
+                File(settings.savePath)
+            } else {
+                File(
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                    "MediaDL/Torrents"
+                )
+            }
+            if (!base.exists()) base.mkdirs()
+            return base
+        }
+
     var currentBrowsePath by mutableStateOf("")
         private set
     var browseItems by mutableStateOf<List<FileItem>>(emptyList())
         private set
     val canGoUp: Boolean
         get() {
-            val root = defaultDir.absolutePath
+            val root = defaultSaveDir.absolutePath
             return currentBrowsePath.isNotBlank() && currentBrowsePath != root
         }
 
-    // ── Notification tracking — must be thread-safe (accessed from IO + Main) ──
     private val notifiedComplete: MutableSet<String> = ConcurrentHashMap.newKeySet()
-
-    private var pollingJob: Job? = null
+    private var observerJob: Job? = null
 
     // ── Init ──
     init {
         try {
             loadSettings()
-            TorrentNotificationHelper.createChannel(appContext)
             startEngine()
         } catch (e: Exception) {
             Log.e("TorrentVM", "Init failed", e)
@@ -93,67 +105,22 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    // ══════════════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════════
     // ENGINE LIFECYCLE
-    // ══════════════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════════
 
     private fun startEngine() {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                TorrentEngine.customSaveDir = settings.savePath
-                TorrentEngine.start(appContext, settings)
-
-                // Polling loop is the sole source of UI state.
-                // Calling JNI from alert-triggered coroutines caused concurrent
-                // handle access and native SIGSEGV (handles are not thread-safe).
-
-                TorrentEngine.onTorrentAdded = { hash ->
-                    viewModelScope.launch(Dispatchers.Main) {
-                        statusMessage = "Torrent added — starting…"
-                        // Add a placeholder card immediately so the user sees progress
-                        // from the first moment. The polling loop will replace it with
-                        // real data within ~700 ms.
-                        if (torrents.none { it.infoHash == hash }) {
-                            torrents.add(
-                                TorrentItem(
-                                    infoHash = hash,
-                                    name = "Fetching metadata…",
-                                    totalSize = 0L, downloadedBytes = 0L, progress = 0f,
-                                    downloadSpeed = 0L, uploadSpeed = 0L,
-                                    seeders = 0, peers = 0,
-                                    state = TorrentState.METADATA
-                                )
-                            )
-                        }
-                        clearStatusAfterDelay()
-                    }
-                }
-
-                TorrentEngine.onTorrentFinished = { hash ->
-                    viewModelScope.launch(Dispatchers.Main) {
-                        if (settings.showNotifications && hash !in notifiedComplete) {
-                            // Look up name from the already-polled list
-                            val item = torrents.firstOrNull { it.infoHash == hash }
-                            if (item != null) TorrentNotificationHelper.showComplete(appContext, item)
-                            notifiedComplete.add(hash)
-                        }
-                    }
-                }
-
-                TorrentEngine.onError = { _, message ->
-                    // No refreshTorrent here — polling handles state updates
-                    viewModelScope.launch(Dispatchers.Main) { errorMessage = message }
-                }
+                TorrentBridge.init(appContext)
+                TorrentBridge.start()
 
                 withContext(Dispatchers.Main) {
                     isEngineRunning = true
-                    currentBrowsePath = defaultDir.absolutePath
+                    currentBrowsePath = defaultSaveDir.absolutePath
                     loadBrowseDir()
                 }
-                // refreshAll fetches from libtorrent on IO, then pushes to Main
-                refreshAll()
-
-                startPolling()
+                startObservingTorrents()
             } catch (e: Throwable) {
                 Log.e("TorrentVM", "Failed to start engine", e)
                 CrashLogger.logException(appContext, "TorrentEngine.start", e)
@@ -164,115 +131,40 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private fun startPolling() {
-        pollingJob?.cancel()
-        pollingJob = viewModelScope.launch(Dispatchers.IO) {
-            while (isActive) {
-                delay(700)
-                // Read expanded hash on Main (Compose state must not be read from IO)
-                val expandedHash = withContext(Dispatchers.Main) { expandedHash }
-                // refreshNow() stores the expanded hash, triggers postTorrentUpdates()
-                // (which causes StateUpdateAlert to fire and update the cache on the
-                // alert-dispatch thread), then returns the current cache immediately.
-                // All JNI reads happen on the alert-dispatch thread — zero JNI here.
-                val items = TorrentEngine.refreshNow(expandedHash)
+    private fun startObservingTorrents() {
+        observerJob?.cancel()
+        observerJob = viewModelScope.launch {
+            TorrentBridge.observeInfoList().collectLatest { listState ->
+                // TorrentListState is a sealed interface: Initial | Loaded
+                val infoList = (listState as? com.bismaya.mediadl.core.model.data.TorrentListState.Loaded)?.list()
+                    ?: return@collectLatest
+                val items = infoList.map { info ->
+                    with(TorrentBridge) { info.toItem() }
+                }
                 withContext(Dispatchers.Main) {
+                    val newHashes = items.map { it.infoHash }.toSet()
                     for (item in items) {
                         val idx = torrents.indexOfFirst { it.infoHash == item.infoHash }
-                        if (idx >= 0) torrents[idx] = item
-                        else torrents.add(item)
+                        if (idx >= 0) torrents[idx] = item else torrents.add(item)
                     }
-                    val currentHashes = items.map { it.infoHash }.toSet()
-                    torrents.removeAll { it.infoHash !in currentHashes }
-                }
-
-                // Snapshot settings on Main (Compose state must not be read from IO)
-                val currentSettings = withContext(Dispatchers.Main) { settings }
-
-                // Notifications for active downloads
-                if (currentSettings.showNotifications) {
-                    items.forEach { item ->
-                        when (item.state) {
-                            TorrentState.DOWNLOADING, TorrentState.METADATA ->
-                                TorrentNotificationHelper.showProgress(appContext, item)
-                            TorrentState.FINISHED, TorrentState.SEEDING -> {
-                                if (item.infoHash !in notifiedComplete) {
-                                    TorrentNotificationHelper.showComplete(appContext, item)
-                                    notifiedComplete.add(item.infoHash)
-                                }
-                                TorrentNotificationHelper.cancel(appContext, item.infoHash)
-                            }
-                            else -> { }
-                        }
-                    }
-                }
-
-                // Auto-queue on low RAM
-                if (currentSettings.autoQueueOnLowRam && TorrentEngine.isLowRam(appContext)) {
-                    TorrentEngine.pauseAllDownloading()
-                    withContext(Dispatchers.Main) {
-                        statusMessage = "Downloads paused — low memory"
-                        clearStatusAfterDelay()
-                    }
-                }
-
-                // Adaptive idle throttle: slow down polling when nothing is active
-                val hasActiveDownload = items.any {
-                    it.state == TorrentState.DOWNLOADING ||
-                    it.state == TorrentState.METADATA ||
-                    it.state == TorrentState.CHECKING
-                }
-                if (!hasActiveDownload) delay(800) // ~1.5 s total cycle when idle
-
-                // WiFi-only check
-                if (currentSettings.wifiOnly && !TorrentEngine.isWifiConnected(appContext)) {
-                    val downloading = items.any {
-                        it.state == TorrentState.DOWNLOADING || it.state == TorrentState.METADATA
-                    }
-                    if (downloading) {
-                        TorrentEngine.pauseAllDownloading()
-                        withContext(Dispatchers.Main) {
-                            statusMessage = "Downloads paused — Wi-Fi not connected"
-                            clearStatusAfterDelay()
-                        }
-                    }
+                    torrents.removeAll { it.infoHash !in newHashes }
                 }
             }
         }
-    }
 
-    /**
-     * Fetch a single torrent item on IO (JNI-safe) then update state on Main.
-     * Safe to call from any thread.
-     */
-    private fun refreshTorrent(hash: String) {
         viewModelScope.launch {
-            val item = withContext(Dispatchers.IO) {
-                TorrentEngine.getTorrentItem(hash)
-            }
-            if (item != null) {
-                val idx = torrents.indexOfFirst { it.infoHash == hash }
-                if (idx >= 0) torrents[idx] = item else torrents.add(0, item)
+            TorrentBridge.observeDeletedTorrentIds().collectLatest { deletedId ->
+                withContext(Dispatchers.Main) {
+                    torrents.removeAll { it.infoHash == deletedId }
+                    notifiedComplete.remove(deletedId)
+                }
             }
         }
     }
 
-    /**
-     * Fetch all torrents on IO (JNI-safe) then update state on Main.
-     * Must be called from within a coroutine.
-     */
-    private suspend fun refreshAll() {
-        val items = withContext(Dispatchers.IO) {
-            TorrentEngine.getAllTorrents()
-        }
-        // Now back on the caller's dispatcher (Main)
-        torrents.clear()
-        torrents.addAll(items)
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════════
     // MAGNET / FILE INPUT
-    // ══════════════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════════
 
     fun onMagnetInputChange(value: String) {
         magnetInput = value
@@ -282,105 +174,93 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
     fun isMagnetValid(): Boolean {
         val trimmed = magnetInput.trim()
         return trimmed.startsWith("magnet:?") ||
-                trimmed.endsWith(".torrent") ||
-                (trimmed.startsWith("http") && "torrent" in trimmed.lowercase())
+            trimmed.endsWith(".torrent") ||
+            (trimmed.startsWith("http") && "torrent" in trimmed.lowercase())
     }
 
     fun addMagnet() {
         val input = magnetInput.trim()
         if (input.isBlank()) return
-        if (!isEngineRunning) {
-            errorMessage = "Torrent engine is not running"
-            return
-        }
-
-        // WiFi-only gate
-        if (settings.wifiOnly && !TorrentEngine.isWifiConnected(appContext)) {
+        if (!isEngineRunning) { errorMessage = "Torrent engine is not running"; return }
+        if (settings.wifiOnly && !isWifiConnected()) {
             errorMessage = "Wi-Fi only mode is enabled — connect to Wi-Fi"
-            return
-        }
-
-        viewModelScope.launch(Dispatchers.IO) {
-            val success = if (input.startsWith("magnet:?")) {
-                TorrentEngine.addMagnet(appContext, input)
-            } else {
-                withContext(Dispatchers.Main) { statusMessage = "Fetching torrent file…" }
-                try {
-                    val url = java.net.URL(input)
-                    val conn = url.openConnection()
-                    conn.connectTimeout = 15000
-                    conn.readTimeout = 15000
-                    val bytes = conn.getInputStream().use { it.readBytes() }
-                    TorrentEngine.addTorrentBytes(appContext, bytes)
-                } catch (e: Exception) {
-                    withContext(Dispatchers.Main) { errorMessage = "Failed to fetch torrent: ${e.message}" }
-                    false
-                }
-            }
-
-            withContext(Dispatchers.Main) {
-                if (success) {
-                    magnetInput = ""
-                    errorMessage = null
-                } else if (errorMessage == null) {
-                    errorMessage = "Failed to add torrent"
-                }
-            }
-        }
-    }
-
-    /** Add magnet URI directly (from SmartBar or intent) */
-    fun addMagnetDirect(uri: String) {
-        if (uri.isBlank() || !isEngineRunning) return
-        viewModelScope.launch(Dispatchers.IO) {
-            TorrentEngine.addMagnet(appContext, uri)
-        }
-    }
-
-    /** Add from content URI (file picker for .torrent files) */
-    fun addTorrentFromUri(uri: Uri) {
-        if (!isEngineRunning) {
-            errorMessage = "Torrent engine is not running"
             return
         }
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val bytes = appContext.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                if (bytes != null) {
-                    val success = TorrentEngine.addTorrentBytes(appContext, bytes)
-                    if (!success) {
-                        withContext(Dispatchers.Main) { errorMessage = "Failed to add torrent file" }
+                if (input.startsWith("magnet:?")) {
+                    val magnet = TorrentBridge.parseMagnet(input)
+                    if (magnet != null) {
+                        TorrentBridge.addTorrent(
+                            source = input, fromMagnet = true,
+                            sha1hash = magnet.sha1hash,
+                            name = magnet.name ?: magnet.sha1hash,
+                            downloadPath = Uri.fromFile(defaultSaveDir)
+                        )
+                        withContext(Dispatchers.Main) { magnetInput = ""; errorMessage = null }
+                    } else {
+                        withContext(Dispatchers.Main) { errorMessage = "Invalid magnet link" }
                     }
                 } else {
-                    withContext(Dispatchers.Main) { errorMessage = "Could not read torrent file" }
+                    withContext(Dispatchers.Main) { statusMessage = "Fetching torrent file…" }
+                    val url = java.net.URL(input)
+                    val conn = url.openConnection()
+                    conn.connectTimeout = 15_000; conn.readTimeout = 15_000
+                    val tmp = File(appContext.cacheDir, "tmp_${System.currentTimeMillis()}.torrent")
+                    conn.getInputStream().use { ins -> tmp.outputStream().use { ins.copyTo(it) } }
+                    TorrentBridge.addTorrentUri(Uri.fromFile(tmp), Uri.fromFile(defaultSaveDir))
+                    tmp.delete()
+                    withContext(Dispatchers.Main) { magnetInput = ""; errorMessage = null }
                 }
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) { errorMessage = "Error reading file: ${e.message}" }
+                Log.e("TorrentVM", "addMagnet failed", e)
+                withContext(Dispatchers.Main) { errorMessage = "Failed to add torrent: ${e.message}" }
             }
         }
     }
 
-    // ══════════════════════════════════════════════════════════════════════════════
-    // TORRENT CONTROL
-    // ══════════════════════════════════════════════════════════════════════════════
-
-    fun pauseTorrent(hash: String) {
+    fun addMagnetDirect(uri: String) {
+        if (uri.isBlank() || !isEngineRunning) return
         viewModelScope.launch(Dispatchers.IO) {
-            TorrentEngine.pause(hash)
-            // Polling will reflect the paused state within 1500 ms
+            try {
+                val magnet = TorrentBridge.parseMagnet(uri)
+                if (magnet != null) {
+                    TorrentBridge.addTorrent(
+                        source = uri, fromMagnet = true,
+                        sha1hash = magnet.sha1hash,
+                        name = magnet.name ?: magnet.sha1hash,
+                        downloadPath = Uri.fromFile(defaultSaveDir)
+                    )
+                }
+            } catch (e: Exception) { Log.e("TorrentVM", "addMagnetDirect failed", e) }
         }
     }
 
+    fun addTorrentFromUri(uri: Uri) {
+        if (!isEngineRunning) { errorMessage = "Torrent engine is not running"; return }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                TorrentBridge.addTorrentUri(uri, Uri.fromFile(defaultSaveDir))
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) { errorMessage = "Error adding torrent: ${e.message}" }
+            }
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // TORRENT CONTROL
+    // ══════════════════════════════════════════════════════════════════════════
+
+    fun pauseTorrent(hash: String) {
+        viewModelScope.launch(Dispatchers.IO) { TorrentBridge.pauseTorrent(hash) }
+    }
+
     fun resumeTorrent(hash: String) {
-        // WiFi-only gate
-        if (settings.wifiOnly && !TorrentEngine.isWifiConnected(appContext)) {
+        if (settings.wifiOnly && !isWifiConnected()) {
             errorMessage = "Wi-Fi only mode — connect to Wi-Fi to resume"
             return
         }
-        viewModelScope.launch(Dispatchers.IO) {
-            TorrentEngine.resume(hash)
-            // Polling will reflect the resumed state within 1500 ms
-        }
+        viewModelScope.launch(Dispatchers.IO) { TorrentBridge.resumeTorrent(hash) }
     }
 
     fun requestDelete(hash: String) {
@@ -390,53 +270,61 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
 
     fun confirmDelete(deleteFiles: Boolean) {
         val hash = pendingDeleteHash ?: return
-        TorrentEngine.remove(hash, deleteFiles)
-        TorrentNotificationHelper.cancel(appContext, hash)
+        viewModelScope.launch(Dispatchers.IO) {
+            TorrentBridge.deleteTorrents(listOf(hash), deleteFiles)
+        }
         torrents.removeAll { it.infoHash == hash }
         pendingDeleteHash = null
         pendingDeleteFiles = false
     }
 
-    fun cancelDelete() {
-        pendingDeleteHash = null
-        pendingDeleteFiles = false
-    }
+    fun cancelDelete() { pendingDeleteHash = null; pendingDeleteFiles = false }
 
     fun toggleExpanded(hash: String) {
         expandedHash = if (expandedHash == hash) null else hash
     }
 
-    fun dismissError() {
-        errorMessage = null
-    }
+    fun dismissError() { errorMessage = null }
 
-    // ── Sequential download ──
     fun toggleSequential(hash: String) {
         viewModelScope.launch(Dispatchers.IO) {
-            val current = TorrentEngine.isSequential(hash)
-            TorrentEngine.setSequentialDownload(hash, !current)
-            // Polling will reflect the change within 1500 ms
+            val current = TorrentBridge.isSequential(hash)
+            TorrentBridge.setSequential(hash, !current)
         }
     }
 
-    // ── File selection / priority ──
+    fun forceRecheck(hash: String) {
+        viewModelScope.launch(Dispatchers.IO) { TorrentBridge.forceRecheck(listOf(hash)) }
+    }
+
+    fun requestTrackerAnnounce(hash: String) {
+        viewModelScope.launch(Dispatchers.IO) { TorrentBridge.forceAnnounce(listOf(hash)) }
+    }
+
+    fun observeTrackers(hash: String) = TorrentBridge.observeTrackers(hash)
+    fun observePeers(hash: String)    = TorrentBridge.observePeers(hash)
+    fun observePieces(hash: String)   = TorrentBridge.observePieces(hash)
+
+    /** Synchronous snapshot of trackers — safe to call from LaunchedEffect. */
+    fun getTrackerList(hash: String): List<TrackerInfo> = TorrentBridge.getTrackerList(hash)
+
+    /** Synchronous snapshot of peers — safe to call from LaunchedEffect. */
+    fun getPeerList(hash: String): List<PeerInfo> = TorrentBridge.getPeerList(hash)
+
+    fun getAdvancedInfo(hash: String): com.bismaya.mediadl.core.model.data.AdvancedTorrentInfo? =
+        TorrentBridge.getAdvancedInfoSync(hash)
+
     fun toggleFileDownload(hash: String, fileIndex: Int) {
         viewModelScope.launch(Dispatchers.IO) {
-            val currentPriority = TorrentEngine.getFilePriority(hash, fileIndex)
-            val newPriority = if (currentPriority == 0) {
-                org.libtorrent4j.Priority.DEFAULT
-            } else {
-                org.libtorrent4j.Priority.IGNORE
-            }
-            TorrentEngine.setFilePriority(hash, fileIndex, newPriority)
-            // Polling will reflect the change within 1500 ms
+            val item = torrents.firstOrNull { it.infoHash == hash } ?: return@launch
+            val file = item.files.getOrNull(fileIndex) ?: return@launch
+            val newPriority = if (file.priority == 0) 4 else 0
+            TorrentBridge.prioritizeFile(hash, fileIndex, newPriority)
         }
     }
 
-    // ── Share magnet link ──
     fun shareMagnet(context: Context, hash: String) {
-        val magnetUri = TorrentEngine.getMagnetUri(hash)
-        if (magnetUri.isBlank()) return
+        val magnetUri = TorrentBridge.makeMagnet(hash) ?: return
         val name = torrents.find { it.infoHash == hash }?.name ?: "Torrent"
         val intent = Intent(Intent.ACTION_SEND).apply {
             type = "text/plain"
@@ -446,31 +334,23 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
         context.startActivity(Intent.createChooser(intent, "Share magnet link"))
     }
 
-    // ── Open downloaded file ──
     fun openFile(context: Context, torrentItem: TorrentItem) {
-        if (torrentItem.files.isEmpty()) return
-        val firstFile = torrentItem.files.first()
+        val firstFile = torrentItem.files.firstOrNull() ?: return
         val file = File(torrentItem.savePath, firstFile.name)
         if (!file.exists()) return
         FileOperations.openFile(context, file)
     }
 
-    // ══════════════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════════
     // SEARCH
-    // ══════════════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════════
 
-    fun onSearchQueryChange(value: String) {
-        searchQuery = value
-        searchError = null
-    }
+    fun onSearchQueryChange(value: String) { searchQuery = value; searchError = null }
 
     fun searchTorrents() {
         val q = searchQuery.trim()
         if (q.isBlank()) return
-        isSearching = true
-        searchError = null
-        searchResults = emptyList()
-
+        isSearching = true; searchError = null; searchResults = emptyList()
         viewModelScope.launch(Dispatchers.IO) {
             val result = TorrentSearchProvider.search(q)
             withContext(Dispatchers.Main) {
@@ -481,23 +361,16 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
                         if (results.isEmpty()) {
                             searchError = "No results found for \"$q\""
                         } else {
-                            // Save search record with top-5 results
                             val snapshot = results.take(5).map { r ->
                                 TorrentSearchResultSnapshot(
-                                    name      = r.name,
-                                    infoHash  = r.infoHash,
-                                    sizeBytes = r.size,
-                                    seeders   = r.seeders,
-                                    category  = r.category
+                                    name = r.name, infoHash = r.infoHash,
+                                    sizeBytes = r.size, seeders = r.seeders, category = r.category
                                 )
                             }
                             val record = TorrentSearchRecord(
-                                query       = q,
-                                timestamp   = System.currentTimeMillis(),
-                                resultCount = results.size,
-                                topResults  = snapshot
+                                query = q, timestamp = System.currentTimeMillis(),
+                                resultCount = results.size, topResults = snapshot
                             )
-                            // Remove old entry with same query (dedup), prepend new one
                             torrentSearchRecords.removeAll { it.query.equals(q, ignoreCase = true) }
                             torrentSearchRecords.add(0, record)
                             if (torrentSearchRecords.size > 25)
@@ -505,57 +378,39 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
                             TorrentSettingsManager.saveSearchRecords(appContext, torrentSearchRecords.toList())
                         }
                     },
-                    onFailure = { e ->
-                        searchError = "Search failed: ${e.message}"
-                    }
+                    onFailure = { e -> searchError = "Search failed: ${e.message}" }
                 )
             }
         }
     }
 
-    /** Pre-fill search query (from SmartBar) and switch to search tab */
     fun initiateSearch(query: String) {
-        searchQuery = query
-        activeTab = TorrentTab.SEARCH
-        searchTorrents()
+        searchQuery = query; activeTab = TorrentTab.SEARCH; searchTorrents()
     }
 
     fun addFromSearchResult(result: TorrentSearchResult) {
-        if (!isEngineRunning) {
-            errorMessage = "Torrent engine is not running"
-            return
-        }
+        if (!isEngineRunning) { errorMessage = "Torrent engine is not running"; return }
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val magnetUri = result.magnetUri
-                val success = TorrentEngine.addMagnet(appContext, magnetUri)
-                if (!success) {
-                    withContext(Dispatchers.Main) {
-                        errorMessage = "Failed to add torrent"
-                    }
+                val magnet = TorrentBridge.parseMagnet(result.magnetUri)
+                if (magnet != null) {
+                    TorrentBridge.addTorrent(
+                        source = result.magnetUri, fromMagnet = true,
+                        sha1hash = magnet.sha1hash, name = result.name,
+                        downloadPath = Uri.fromFile(defaultSaveDir)
+                    )
+                } else {
+                    withContext(Dispatchers.Main) { errorMessage = "Failed to add torrent" }
                 }
             } catch (e: Throwable) {
                 Log.e("TorrentVM", "addFromSearchResult failed", e)
                 CrashLogger.logException(appContext, "addFromSearchResult", e)
-                withContext(Dispatchers.Main) {
-                    errorMessage = "Failed to add torrent: ${e.message}"
-                }
+                withContext(Dispatchers.Main) { errorMessage = "Failed to add torrent: ${e.message}" }
             }
         }
         activeTab = TorrentTab.ACTIVE
         statusMessage = "Adding: ${result.name}"
-        clearStatusAfterDelay()
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════════
-    // SETTINGS
-    // ══════════════════════════════════════════════════════════════════════════════
-
-    private fun loadSettings() {
-        settings = TorrentSettingsManager.load(appContext)
-        val saved = TorrentSettingsManager.loadSearchRecords(appContext)
-        torrentSearchRecords.clear()
-        torrentSearchRecords.addAll(saved)
+        viewModelScope.launch { delay(3000); statusMessage = null }
     }
 
     fun clearTorrentSearchHistory() {
@@ -563,78 +418,69 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
         TorrentSettingsManager.saveSearchRecords(appContext, emptyList())
     }
 
+    // ══════════════════════════════════════════════════════════════════════════
+    // SETTINGS
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private fun loadSettings() {
+        settings = TorrentSettingsManager.load(appContext)
+        val saved = TorrentSettingsManager.loadSearchRecords(appContext)
+        torrentSearchRecords.clear(); torrentSearchRecords.addAll(saved)
+    }
+
     fun updateSettings(newSettings: TorrentPrefs) {
         settings = newSettings
         TorrentSettingsManager.save(appContext, newSettings)
-        // Apply runtime changes
-        TorrentEngine.setSpeedLimits(newSettings.downloadSpeedLimit, newSettings.uploadSpeedLimit)
-        TorrentEngine.customSaveDir = newSettings.savePath
+        TorrentBridge.setSpeedLimits(newSettings.downloadSpeedLimit, newSettings.uploadSpeedLimit)
     }
 
-    // ══════════════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════════
     // FILE BROWSER
-    // ══════════════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════════
 
     fun loadBrowseDir() {
-        if (currentBrowsePath.isBlank()) {
-            currentBrowsePath = defaultDir.absolutePath
-        }
+        if (currentBrowsePath.isBlank()) currentBrowsePath = defaultSaveDir.absolutePath
         val dir = File(currentBrowsePath)
         if (!dir.exists()) dir.mkdirs()
-        val children = dir.listFiles()?.toList() ?: emptyList()
-        browseItems = children
+        browseItems = (dir.listFiles()?.toList() ?: emptyList())
             .map { FileItem(it) }
             .sortedWith(compareByDescending<FileItem> { it.isDirectory }.thenBy { it.name.lowercase() })
     }
 
     fun navigateTo(item: FileItem) {
-        if (item.isDirectory) {
-            currentBrowsePath = item.file.absolutePath
-            loadBrowseDir()
-        }
+        if (item.isDirectory) { currentBrowsePath = item.file.absolutePath; loadBrowseDir() }
     }
 
     fun navigateUp() {
         val current = File(currentBrowsePath)
-        val root = defaultDir.absolutePath
+        val root = defaultSaveDir.absolutePath
         val parent = current.parentFile
         if (parent != null && current.absolutePath != root) {
-            currentBrowsePath = parent.absolutePath
-            loadBrowseDir()
+            currentBrowsePath = parent.absolutePath; loadBrowseDir()
         }
     }
 
-    fun openBrowseFile(context: Context, item: FileItem) {
-        FileOperations.openFile(context, item.file)
-    }
-
-    fun deleteBrowseFile(item: FileItem) {
-        FileOperations.deleteFile(item.file)
-        loadBrowseDir()
-    }
-
-    fun shareBrowseFile(context: Context, item: FileItem) {
-        FileOperations.shareFile(context, item.file)
-    }
-
+    fun openBrowseFile(context: Context, item: FileItem) = FileOperations.openFile(context, item.file)
+    fun deleteBrowseFile(item: FileItem) { FileOperations.deleteFile(item.file); loadBrowseDir() }
+    fun shareBrowseFile(context: Context, item: FileItem) = FileOperations.shareFile(context, item.file)
     fun renameBrowseFile(item: FileItem, newName: String) {
-        FileOperations.renameFile(item.file, newName)
-        loadBrowseDir()
+        FileOperations.renameFile(item.file, newName); loadBrowseDir()
     }
 
-    // ══════════════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════════
     // HELPERS
-    // ══════════════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════════
 
-    private fun clearStatusAfterDelay() {
-        viewModelScope.launch {
-            delay(3000)
-            statusMessage = null
-        }
+    private fun isWifiConnected(): Boolean {
+        val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val net = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(net) ?: return false
+        return caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
     }
 
     override fun onCleared() {
-        pollingJob?.cancel()
+        observerJob?.cancel()
+        TorrentBridge.requestStop()
         super.onCleared()
     }
 }

@@ -27,11 +27,16 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // Only package arm64 — covers all modern Android 7+ devices (64-bit).
-        // armeabi-v7a (32-bit) accounts for ~42MB and applies to essentially
-        // zero real devices at API 24+. Drop it to halve the APK size.
+        multiDexEnabled = true
+
         ndk {
             abiFilters += listOf("arm64-v8a")
+        }
+
+        javaCompileOptions {
+            annotationProcessorOptions {
+                arguments["room.schemaLocation"] = "$projectDir/schemas"
+            }
         }
     }
 
@@ -60,14 +65,17 @@ android {
         }
     }
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
+        // Required for java.time APIs on API < 26 (used by Room & libretorrent session layer)
+        isCoreLibraryDesugaringEnabled = true
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions {
-        jvmTarget = "11"
+        jvmTarget = "17"
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
     packaging {
         jniLibs.useLegacyPackaging = true
@@ -93,15 +101,65 @@ dependencies {
 }
 
 dependencies {
+    // Core library desugaring (java.time APIs on API < 26)
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
+
+    // ── Media download (yt-dlp / ffmpeg) ────────────────────────────────────
     implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
     implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.18.1")
-    implementation("androidx.documentfile:documentfile:1.0.1")
+
+    // ── AndroidX ────────────────────────────────────────────────────────────
+    implementation("androidx.documentfile:documentfile:1.1.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
+    implementation("androidx.lifecycle:lifecycle-livedata-core:2.8.7")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("io.coil-kt:coil-compose:2.7.0")
     implementation("androidx.core:core-splashscreen:1.0.1")
+    implementation("androidx.activity:activity:1.11.0")
+    implementation("androidx.work:work-runtime:2.11.0")
+    // Fix for WorkManager https://github.com/google/ExoPlayer/issues/7993
+    implementation("com.google.guava:guava:33.5.0-jre")
 
-    // BitTorrent engine (libtorrent4j)
-    implementation("org.libtorrent4j:libtorrent4j:2.1.0-31")
-    implementation("org.libtorrent4j:libtorrent4j-android-arm64:2.1.0-31")
+    // ── Room (libretorrent storage layer) ───────────────────────────────────
+    val roomVersion = "2.6.1"
+    implementation("androidx.room:room-runtime:$roomVersion")
+    implementation("androidx.room:room-rxjava3:$roomVersion")
+    annotationProcessor("androidx.room:room-compiler:$roomVersion")
+
+    // ── ReactiveX (used extensively by libretorrent session layer) ──────────
+    implementation("io.reactivex.rxjava3:rxjava:3.1.9")
+    implementation("io.reactivex.rxjava3:rxandroid:3.0.2")
+
+    // ── BitTorrent engine (libtorrent4j) — upgraded to match libretorrent ───
+    // Only arm64 to keep APK lean; add other ABIs if needed
+    implementation("org.libtorrent4j:libtorrent4j:2.1.0-38")
+    implementation("org.libtorrent4j:libtorrent4j-android-arm64:2.1.0-38")
+
+    // ── Apache Commons (used by TorrentSessionImpl, TorrentMetaInfo) ────────
+    // Do NOT upgrade commons-io >= 2.6 (uses Java NIO, requires API >= 26)
+    //noinspection GradleDependency
+    implementation("commons-io:commons-io:2.5")
+    implementation("org.apache.commons:commons-text:1.14.0")
+
+    // ── Preference (used by Settings layer) ─────────────────────────────────
+    implementation("androidx.preference:preference:1.2.1")
+
+    // ── Coroutines → RxJava3 bridge (TorrentBridge.kt uses Flowable.asFlow()) ──
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-reactive:1.8.1")
+
+    // ── Moshi (SettingsRepositoryImpl serialises preferences as JSON) ────────
+    implementation("com.squareup.moshi:moshi:1.15.2")
+    implementation("com.squareup.moshi:moshi-adapters:1.15.2")
+
+    // ── Gson (FeedRepositoryImpl) ────────────────────────────────────────────
+    implementation("com.google.code.gson:gson:2.13.2")
+
+    // ── jurl (NormalizeUrl / PercentEncoder URL normalizer) ──────────────────
+    implementation("com.github.anthonynsimon:jurl:v0.4.2")
+
+    // ── JNA (TorrentInputStream native calls) ────────────────────────────────
+    implementation("net.java.dev.jna:jna:5.18.1@aar")
+
+    // ── AppCompat (applyNightMode in libretorrent via AppCompatDelegate) ─────
+    implementation("androidx.appcompat:appcompat:1.7.1")
 }

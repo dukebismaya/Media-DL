@@ -366,6 +366,13 @@ fun playMedia(context: Context, record: DownloadRecord) {
 // --- Activity -------------------------------------------------------------------
 class MainActivity : ComponentActivity() {
 
+    companion object {
+        /** Action fired when tapping a torrent-specific notification to open its details. */
+        const val ACTION_OPEN_TORRENT_DETAILS = "com.bismaya.mediadl.ACTION_OPEN_TORRENT_DETAILS"
+        /** Extra key carrying the torrent info-hash string for the details screen. */
+        const val KEY_TORRENT_ID = "torrent_id"
+    }
+
     // Holds a URL shared into the app from the system share sheet.
     private var sharedUrl by mutableStateOf<String?>(null)
     // Holds a magnet URI received via intent (deep link or share)
@@ -1904,7 +1911,9 @@ fun DownloadsTorrentRow(
         TorrentState.PAUSED                             -> Amber
         TorrentState.ERROR                              -> Rose
         TorrentState.CHECKING                           -> VioletLight
+        TorrentState.MOVING                             -> Amber
         TorrentState.QUEUED                             -> TextTertiary
+        TorrentState.STOPPED, TorrentState.UNKNOWN      -> TextTertiary
     }
     val stateLabel = when (torrent.state) {
         TorrentState.DOWNLOADING -> "Downloading"
@@ -1915,6 +1924,9 @@ fun DownloadsTorrentRow(
         TorrentState.ERROR       -> "Error"
         TorrentState.CHECKING    -> "Checking"
         TorrentState.QUEUED      -> "Queued"
+        TorrentState.MOVING      -> "Moving…"
+        TorrentState.STOPPED     -> "Stopped"
+        TorrentState.UNKNOWN     -> "Unknown"
     }
     val isActive = torrent.state == TorrentState.DOWNLOADING ||
                    torrent.state == TorrentState.METADATA   ||
