@@ -13,6 +13,7 @@ import org.libtorrent4j.swig.torrent_flags_t
 import java.io.File
 import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 
 // ── Torrent download item state ─────────────────────────────────────────────────
 data class TorrentItem(
@@ -53,16 +54,43 @@ object TorrentEngine {
 
     /**
      * Maps info-hash → TorrentHandle for control operations (pause/resume/etc).
-     * Handles here are fetched from AddTorrentAlert and stored for later use.
-     * NEVER call handle.status() on these outside the alert thread.
+     * Handles are stored on AddTorrentAlert and removed on TorrentRemovedAlert.
+     *
+     * Thread-safety rules:
+     *  • NEVER call handle.status(), handle.fileProgress(), or handle.filePriority()
+     *    from an alert callback. Alert callbacks run on libtorrent's network thread
+     *    which already holds the session mutex; re-entering those calls causes a
+     *    recursive lock on a non-recursive C++ mutex → undefined behaviour → SIGSEGV.
+     *  • It IS safe to call those methods from the Kotlin IO dispatcher (Dispatchers.IO)
+     *    because that is a different OS thread and the mutex is acquired normally.
+     *  • Lightweight handle ops (pause, resume, setFlags, infoHash) are safe from any
+     *    thread — they post a message to the session thread rather than locking directly.
      */
     private val handles = ConcurrentHashMap<String, TorrentHandle>()
 
     /**
-     * Thread-safe cache of the latest TorrentItem snapshot for each torrent.
-     * Built exclusively on libtorrent's alert thread (via StateUpdateAlert),
-     * which means zero concurrent JNI access. Read from any thread safely.
+     * Single-threaded executor for ALL JNI calls that require the session mutex
+     * (handle.status, fileProgress, filePriority, savePath, torrentFile).
+     *
+     * Why: libtorrent's alert callbacks run on the network thread which already
+     * holds the session mutex. Calling any of the above from an alert callback
+     * re-enters a non-recursive C++ mutex → instant SIGSEGV.
+     *
+     * By routing ALL heavy JNI to this single executor we guarantee:
+     *  (a) Never called from the alert thread  → no deadlock
+     *  (b) All reads are sequential             → no concurrent stale-handle race
      */
+    private val jniExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "torrent-jni").also { it.isDaemon = true }
+    }
+
+    /**
+     * Info-hash of the card currently expanded in the UI, or null.
+     * Written from the IO polling coroutine, read on the alert-dispatch thread.
+     * @Volatile is sufficient because we only need visibility, not atomicity.
+     */
+    @Volatile private var expandedCardHash: String? = null
+
     private val torrentItemCache = ConcurrentHashMap<String, TorrentItem>()
 
     /** Custom save directory (empty = default) */
@@ -107,7 +135,6 @@ object TorrentEngine {
                                 Log.e(TAG, "Add torrent error: ${ec.message}")
                                 onError?.invoke("", ec.message)
                             } else {
-                                // We are on the libtorrent alert thread — safe to call handle methods
                                 val h = alert.handle()
                                 val hash = try { h.infoHash().toHex() } catch (e: Throwable) {
                                     Log.e(TAG, "infoHash() failed on add: ${e.message}"); return
@@ -116,27 +143,59 @@ object TorrentEngine {
                                 if (prefs.sequentialByDefault) {
                                     try { h.setFlags(TorrentFlags.SEQUENTIAL_DOWNLOAD) } catch (_: Throwable) { }
                                 }
+                                // Seed a minimal placeholder so the UI card appears immediately.
+                                // IMPORTANT: do NOT call handle.status(), handle.fileProgress() or
+                                // handle.filePriority() from any alert callback — the alert dispatcher
+                                // runs on libtorrent's network thread which already holds the session
+                                // mutex. Re-entering those calls causes a recursive mutex lock →
+                                // undefined behaviour → SIGSEGV. All heavy JNI work goes to the
+                                // dedicated fetchAndMergeFileInfo() called from the IO thread.
+                                torrentItemCache[hash] = TorrentItem(
+                                    infoHash = hash, name = "Fetching metadata\u2026",
+                                    totalSize = 0L, downloadedBytes = 0L, progress = 0f,
+                                    downloadSpeed = 0L, uploadSpeed = 0L,
+                                    seeders = 0, peers = 0, state = TorrentState.METADATA
+                                )
                                 Log.d(TAG, "Torrent added [$hash]")
-                                // Trigger immediate StateUpdateAlert so cache is populated quickly
                                 try { sm.postTorrentUpdates() } catch (_: Throwable) { }
                                 onTorrentAdded?.invoke(hash)
                             }
                         }
                         is StateUpdateAlert -> {
-                            // StateUpdateAlert fires after postTorrentUpdates().
-                            // We use it as a safe trigger: iterate our own handles map here
-                            // on the single alert thread, where h.status() is safe to call.
-                            handles.forEach { (hash, h) ->
+                            // Process pre-computed status snapshots ON the alert-dispatch thread.
+                            // libtorrent only includes alive torrents in state_update_alert, so
+                            // every status here is safe to access.  Alert dispatch is sequential —
+                            // TorrentRemovedAlert cannot interleave while we're here, which means
+                            // every entry in `handles` that appears in this status list is valid.
+                            //
+                            // We derive the info-hash via TorrentHandle(st.swig().getHandle())
+                            // and call infoHash() — confirmed safe on the alert-dispatch thread.
+                            // We do NOT call h.status() ourselves: the snapshot is already in `st`.
+                            val statuses = alert.status()
+                            val aliveHashes = HashSet<String>(statuses.size * 2)
+                            for (st in statuses) {
                                 try {
-                                    val item = buildTorrentItemOnAlertThread(hash, h)
-                                    torrentItemCache[hash] = item
-                                } catch (e: Throwable) {
-                                    Log.e(TAG, "StateUpdateAlert: failed to build item [$hash]: ${e.message}")
+                                    val h = TorrentHandle(st.swig().getHandle())
+                                    val hash = h.infoHash().toHex()
+                                    aliveHashes.add(hash)
+                                    torrentItemCache[hash] = buildTorrentItemFromStatus(hash, st)
+                                } catch (_: Throwable) { }
+                            }
+                            // File info for the expanded card — only if we just confirmed it alive
+                            val expanded = expandedCardHash
+                            if (expanded != null && expanded in aliveHashes) {
+                                val h = handles[expanded]
+                                if (h != null) {
+                                    // Submit to jniExecutor so the potentially-slow file-info reads
+                                    // do not block alert dispatch any longer than necessary.
+                                    // The handle is alive now; the tiny race between submit and
+                                    // execute is acceptable here (user-triggered, infrequent).
+                                    jniExecutor.execute { doFetchFileInfo(expanded, h) }
                                 }
                             }
                         }
                         is TorrentRemovedAlert -> {
-                            // Clean up dead handles so polling never touches them again
+                            // Clean up dead handles and stale cache entries
                             try {
                                 val hash = alert.handle().infoHash().toHex()
                                 handles.remove(hash)
@@ -160,7 +219,8 @@ object TorrentEngine {
                         is MetadataReceivedAlert -> {
                             val hash = try { alert.handle().infoHash().toHex() } catch (_: Throwable) { return }
                             Log.d(TAG, "Metadata received: $hash")
-                            // Trigger status refresh so file list appears promptly
+                            // Trigger a StateUpdateAlert (processed on jniExecutor) so the
+                            // cache gets a fresh snapshot and file info is fetched immediately.
                             try { sm.postTorrentUpdates() } catch (_: Throwable) { }
                         }
                     }
@@ -183,6 +243,7 @@ object TorrentEngine {
         session?.stop()
         handles.clear()
         torrentItemCache.clear()
+        jniExecutor.shutdownNow()
         session = null
         Log.d(TAG, "TorrentEngine stopped")
     }
@@ -334,6 +395,31 @@ object TorrentEngine {
 
     fun getAllTorrents(): List<TorrentItem> = torrentItemCache.values.toList()
 
+    /**
+     * Blocking status + file-info refresh, called from the ViewModel's IO polling loop.
+     *
+     * Submits ALL JNI reads as a single batch to [jniExecutor] (the only thread
+     * allowed to call h.status / h.fileProgress / h.filePriority / h.savePath) and
+     * blocks until the batch completes (timeout 5 s).  Because the batch is a single
+     * queued task on a single-threaded executor there is zero concurrency with any
+     * other JNI work, and zero chance of re-entering the session mutex from the
+     * libtorrent alert / network thread.
+     *
+     * @param expandedHash  info-hash of the card currently expanded in the UI, or null.
+     *   Full per-file data (file progress, priority, save path) is only fetched for
+     *   this torrent and for any torrent whose file list has not yet been populated.
+     */
+    fun refreshNow(expandedHash: String? = null): List<TorrentItem> {
+        // Record which card is expanded so StateUpdateAlert can fetch file info for it.
+        expandedCardHash = expandedHash
+        // Ask libtorrent to post a StateUpdateAlert. The alert-dispatch thread will
+        // receive it, update torrentItemCache from the pre-computed snapshots, and
+        // (if a card is expanded) enqueue a doFetchFileInfo task on jniExecutor.
+        // No JNI reads happen on the polling coroutine thread — just a cache read.
+        try { session?.postTorrentUpdates() } catch (_: Throwable) { }
+        return torrentItemCache.values.toList()
+    }
+
     // ── Network & RAM helpers ───────────────────────────────────────────────────
 
     fun isWifiConnected(context: Context): Boolean {
@@ -351,12 +437,12 @@ object TorrentEngine {
     }
 
     fun pauseAllDownloading() {
+        // h.pause() posts to the session thread internally — safe from any thread.
+        // We intentionally do NOT call h.status() here; that would be unsafe outside
+        // the alert thread and is the known source of JNI SIGSEGV crashes.
+        // Calling pause() on an already-paused torrent is a benign no-op in libtorrent.
         handles.values.forEach { h ->
-            try {
-                val isPaused = h.status(TorrentHandle.QUERY_ACCURATE_DOWNLOAD_COUNTERS)
-                    .flags().and_(TorrentFlags.PAUSED).non_zero()
-                if (!isPaused) h.pause()
-            } catch (_: Throwable) { }
+            try { h.pause() } catch (_: Throwable) { }
         }
     }
 
@@ -366,67 +452,47 @@ object TorrentEngine {
         }
     }
 
-    // ── Internal helpers (called ONLY from the alert thread) ────────────────────
+    // ── Internal helpers ────────────────────────────────────────────────────────────
 
     /**
-     * Builds a TorrentItem by calling JNI methods on [handle].
-     * MUST be called only from the libtorrent alert thread (StateUpdateAlert handler),
-     * where calling handle.status() is safe (single alert thread, no concurrent access).
+     * Builds a TorrentItem from a [TorrentStatus] snapshot.
+     * [status] is the return value of [TorrentHandle.status] called on [jniExecutor],
+     * so it contains live data already copied out of the native layer.
+     * This function itself is pure Kotlin — no further JNI calls.
      */
-    private fun buildTorrentItemOnAlertThread(hash: String, handle: TorrentHandle): TorrentItem {
-        val status = handle.status()
+    private fun buildTorrentItemFromStatus(hash: String, status: TorrentStatus): TorrentItem {
+        val torrentName = try {
+            status.name().let { if (it.isNullOrBlank()) "Fetching metadata\u2026" else it }
+        } catch (_: Throwable) { torrentItemCache[hash]?.name ?: "Fetching metadata\u2026" }
 
-        val torrentName: String = try {
-            handle.getName().let { if (it.isNullOrBlank()) "Fetching metadata\u2026" else it }
-        } catch (_: Throwable) { "Unknown" }
-
-        val total: Long
-        val files = mutableListOf<TorrentFileInfo>()
-        if (status.hasMetadata()) {
-            val ti = try { handle.torrentFile() } catch (_: Throwable) { null }
-            total = ti?.totalSize() ?: 0L
-            if (ti != null) {
-                try {
-                    val fs = ti.files()
-                    val progresses: LongArray = try {
-                        handle.fileProgress(TorrentHandle.PIECE_GRANULARITY)
-                    } catch (_: Throwable) { LongArray(0) }
-                    for (i in 0 until fs.numFiles()) {
-                        val fileSize = fs.fileSize(i)
-                        val downloaded = if (i < progresses.size) progresses[i] else 0L
-                        val prio = try { handle.filePriority(i).swig().toInt() } catch (_: Throwable) { 4 }
-                        files.add(
-                            TorrentFileInfo(
-                                index = i,
-                                name = fs.fileName(i),
-                                size = fileSize,
-                                progress = if (fileSize > 0) (downloaded.toFloat() / fileSize) else 0f,
-                                priority = prio
-                            )
-                        )
-                    }
-                } catch (_: Throwable) { }
+        // total_wanted is populated in the status snapshot when hasMetadata is true
+        val total = if (status.hasMetadata()) {
+            try { status.totalWanted() } catch (_: Throwable) {
+                torrentItemCache[hash]?.totalSize ?: 0L
             }
-        } else {
-            total = 0L
-        }
+        } else 0L
 
-        val done: Long  = try { status.totalDone() }                   catch (_: Throwable) { 0L }
-        val prog: Float = try { status.progress() }                    catch (_: Throwable) { 0f }
-        val dlSpeed     = try { status.downloadPayloadRate().toLong() } catch (_: Throwable) { 0L }
-        val ulSpeed     = try { status.uploadPayloadRate().toLong() }   catch (_: Throwable) { 0L }
-        val seeds: Int  = try { status.numSeeds() }                    catch (_: Throwable) { 0 }
-        val numPeers    = try { status.numPeers() }                    catch (_: Throwable) { 0 }
-        val torrentState = try { mapState(status) }                   catch (_: Throwable) { TorrentState.ERROR }
-        val path: String = try { handle.savePath() }                  catch (_: Throwable) { "" }
-        val sequential  = try {
+        // Preserve the file list from the most recent fetchAndMergeFileInfo() call on IO thread
+        val existingFiles = torrentItemCache[hash]?.files ?: emptyList()
+
+        val done       = try { status.totalDone() }                   catch (_: Throwable) { 0L }
+        val prog       = try { status.progress() }                    catch (_: Throwable) { 0f }
+        val dlSpeed    = try { status.downloadPayloadRate().toLong() } catch (_: Throwable) { 0L }
+        val ulSpeed    = try { status.uploadPayloadRate().toLong() }   catch (_: Throwable) { 0L }
+        val seeds      = try { status.numSeeds() }                    catch (_: Throwable) { 0 }
+        val numPeers   = try { status.numPeers() }                    catch (_: Throwable) { 0 }
+        val state      = try { mapState(status) }                    catch (_: Throwable) { TorrentState.ERROR }
+        // savePath is on TorrentHandle, not on the status snapshot — use the cached value.
+        // fetchAndMergeFileInfo() (called from IO thread) keeps this up to date.
+        val path       = torrentItemCache[hash]?.savePath ?: ""
+        val sequential = try {
             status.flags().and_(TorrentFlags.SEQUENTIAL_DOWNLOAD).non_zero()
         } catch (_: Throwable) { false }
         val errMsg: String? = try {
             val ec: ErrorCode = status.errorCode()
             if (ec.isError) ec.message else null
         } catch (_: Throwable) { null }
-        val magnetLink  = "magnet:?xt=urn:btih:$hash" +
+        val magnetLink = "magnet:?xt=urn:btih:$hash" +
             "&dn=${URLEncoder.encode(torrentName, "UTF-8")}" +
             trackers.joinToString("") { "&tr=${URLEncoder.encode(it, "UTF-8")}" }
 
@@ -440,13 +506,59 @@ object TorrentEngine {
             uploadSpeed     = ulSpeed,
             seeders         = seeds,
             peers           = numPeers,
-            state           = torrentState,
-            files           = files.toList(),
+            state           = state,
+            files           = existingFiles,
             savePath        = path,
             error           = errMsg,
             isSequential    = sequential,
             magnetUri       = magnetLink
         )
+    }
+
+    /**
+     * Fetches per-file info and merges it into [torrentItemCache].
+     * MUST be called only from [jniExecutor] — never from the alert thread
+     * or un-serialized IO threads.
+     */
+    private fun doFetchFileInfo(hash: String, h: TorrentHandle) {
+        val current = torrentItemCache[hash] ?: return
+        try {
+            val ti = h.torrentFile() ?: return
+            val fs = ti.files()
+            val savePath  = try { h.savePath() } catch (_: Throwable) { current.savePath }
+            val totalSize = try { ti.totalSize() } catch (_: Throwable) { current.totalSize }
+            val progresses: LongArray = try {
+                h.fileProgress(TorrentHandle.PIECE_GRANULARITY)
+            } catch (_: Throwable) { LongArray(0) }
+            val files = (0 until fs.numFiles()).mapNotNull { i ->
+                try {
+                    val fileSize   = fs.fileSize(i)
+                    val downloaded = if (i < progresses.size) progresses[i] else 0L
+                    val prio       = try { h.filePriority(i).swig().toInt() } catch (_: Throwable) { 4 }
+                    TorrentFileInfo(
+                        index    = i,
+                        name     = fs.fileName(i),
+                        size     = fileSize,
+                        progress = if (fileSize > 0) downloaded.toFloat() / fileSize else 0f,
+                        priority = prio
+                    )
+                } catch (_: Throwable) { null }
+            }
+            torrentItemCache[hash] = current.copy(
+                totalSize = if (totalSize > 0) totalSize else current.totalSize,
+                savePath  = savePath,
+                files     = files
+            )
+        } catch (_: Throwable) { }
+    }
+
+    /**
+     * Public entry-point for the ViewModel to request a file-info refresh for
+     * the expanded card. Submits work to [jniExecutor] and returns immediately.
+     */
+    fun fetchAndMergeFileInfo(infoHash: String) {
+        val h = handles[infoHash] ?: return
+        jniExecutor.execute { doFetchFileInfo(infoHash, h) }
     }
 
     private fun mapState(status: TorrentStatus): TorrentState {

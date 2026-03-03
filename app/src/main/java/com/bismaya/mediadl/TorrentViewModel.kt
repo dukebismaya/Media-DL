@@ -168,12 +168,14 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
         pollingJob?.cancel()
         pollingJob = viewModelScope.launch(Dispatchers.IO) {
             while (isActive) {
-                // Ask libtorrent to post a StateUpdateAlert → cache refreshed on alert thread
-                TorrentEngine.requestStatusUpdates()
-                // Short delay: gives the alert thread time to process StateUpdateAlert.
-                // 700 ms keeps the progress bar smooth; idle cycles self-throttle below.
                 delay(700)
-                val items = TorrentEngine.getAllTorrents()
+                // Read expanded hash on Main (Compose state must not be read from IO)
+                val expandedHash = withContext(Dispatchers.Main) { expandedHash }
+                // refreshNow() stores the expanded hash, triggers postTorrentUpdates()
+                // (which causes StateUpdateAlert to fire and update the cache on the
+                // alert-dispatch thread), then returns the current cache immediately.
+                // All JNI reads happen on the alert-dispatch thread — zero JNI here.
+                val items = TorrentEngine.refreshNow(expandedHash)
                 withContext(Dispatchers.Main) {
                     for (item in items) {
                         val idx = torrents.indexOfFirst { it.infoHash == item.infoHash }
