@@ -56,6 +56,7 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
         private set
     var searchError by mutableStateOf<String?>(null)
         private set
+    val torrentSearchRecords = mutableStateListOf<TorrentSearchRecord>()
 
     // ── Settings state ──
     var settings by mutableStateOf(TorrentPrefs())
@@ -106,11 +107,24 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
                 // Calling JNI from alert-triggered coroutines caused concurrent
                 // handle access and native SIGSEGV (handles are not thread-safe).
 
-                TorrentEngine.onTorrentAdded = { _ ->
-                    // Polling will add the full TorrentItem within 1500 ms.
-                    // Just show a status message here.
+                TorrentEngine.onTorrentAdded = { hash ->
                     viewModelScope.launch(Dispatchers.Main) {
                         statusMessage = "Torrent added — starting…"
+                        // Add a placeholder card immediately so the user sees progress
+                        // from the first moment. The polling loop will replace it with
+                        // real data within ~700 ms.
+                        if (torrents.none { it.infoHash == hash }) {
+                            torrents.add(
+                                TorrentItem(
+                                    infoHash = hash,
+                                    name = "Fetching metadata…",
+                                    totalSize = 0L, downloadedBytes = 0L, progress = 0f,
+                                    downloadSpeed = 0L, uploadSpeed = 0L,
+                                    seeders = 0, peers = 0,
+                                    state = TorrentState.METADATA
+                                )
+                            )
+                        }
                         clearStatusAfterDelay()
                     }
                 }
@@ -156,7 +170,9 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
             while (isActive) {
                 // Ask libtorrent to post a StateUpdateAlert → cache refreshed on alert thread
                 TorrentEngine.requestStatusUpdates()
-                delay(1500)
+                // Short delay: gives the alert thread time to process StateUpdateAlert.
+                // 700 ms keeps the progress bar smooth; idle cycles self-throttle below.
+                delay(700)
                 val items = TorrentEngine.getAllTorrents()
                 withContext(Dispatchers.Main) {
                     for (item in items) {
@@ -197,6 +213,14 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
                         clearStatusAfterDelay()
                     }
                 }
+
+                // Adaptive idle throttle: slow down polling when nothing is active
+                val hasActiveDownload = items.any {
+                    it.state == TorrentState.DOWNLOADING ||
+                    it.state == TorrentState.METADATA ||
+                    it.state == TorrentState.CHECKING
+                }
+                if (!hasActiveDownload) delay(800) // ~1.5 s total cycle when idle
 
                 // WiFi-only check
                 if (currentSettings.wifiOnly && !TorrentEngine.isWifiConnected(appContext)) {
@@ -452,7 +476,32 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
                 result.fold(
                     onSuccess = { results ->
                         searchResults = results
-                        if (results.isEmpty()) searchError = "No results found for \"$q\""
+                        if (results.isEmpty()) {
+                            searchError = "No results found for \"$q\""
+                        } else {
+                            // Save search record with top-5 results
+                            val snapshot = results.take(5).map { r ->
+                                TorrentSearchResultSnapshot(
+                                    name      = r.name,
+                                    infoHash  = r.infoHash,
+                                    sizeBytes = r.size,
+                                    seeders   = r.seeders,
+                                    category  = r.category
+                                )
+                            }
+                            val record = TorrentSearchRecord(
+                                query       = q,
+                                timestamp   = System.currentTimeMillis(),
+                                resultCount = results.size,
+                                topResults  = snapshot
+                            )
+                            // Remove old entry with same query (dedup), prepend new one
+                            torrentSearchRecords.removeAll { it.query.equals(q, ignoreCase = true) }
+                            torrentSearchRecords.add(0, record)
+                            if (torrentSearchRecords.size > 25)
+                                torrentSearchRecords.removeAt(torrentSearchRecords.size - 1)
+                            TorrentSettingsManager.saveSearchRecords(appContext, torrentSearchRecords.toList())
+                        }
                     },
                     onFailure = { e ->
                         searchError = "Search failed: ${e.message}"
@@ -502,6 +551,14 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
 
     private fun loadSettings() {
         settings = TorrentSettingsManager.load(appContext)
+        val saved = TorrentSettingsManager.loadSearchRecords(appContext)
+        torrentSearchRecords.clear()
+        torrentSearchRecords.addAll(saved)
+    }
+
+    fun clearTorrentSearchHistory() {
+        torrentSearchRecords.clear()
+        TorrentSettingsManager.saveSearchRecords(appContext, emptyList())
     }
 
     fun updateSettings(newSettings: TorrentPrefs) {

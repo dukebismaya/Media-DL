@@ -560,9 +560,9 @@ fun MediaDLApp(
                         onNavigateToTorrent = { vm.currentNavTab = NavTab.TORRENT },
                         modifier = Modifier.padding(paddingValues)
                     )
-                    NavTab.DOWNLOADS -> DownloadsScreen(vm = vm, modifier = Modifier.padding(paddingValues))
+                    NavTab.DOWNLOADS -> DownloadsScreen(vm = vm, torrentVm = torrentVm, modifier = Modifier.padding(paddingValues))
                     NavTab.TORRENT -> TorrentScreen(vm = torrentVm, modifier = Modifier.padding(paddingValues))
-                    NavTab.HISTORY -> HistoryScreen(vm = vm, modifier = Modifier.padding(paddingValues))
+                    NavTab.HISTORY -> HistoryScreen(vm = vm, torrentVm = torrentVm, modifier = Modifier.padding(paddingValues))
                     NavTab.ABOUT -> AboutScreen(vm = vm, modifier = Modifier.padding(paddingValues))
                 }
             }
@@ -1343,7 +1343,7 @@ fun FilterChipsRow(
 
 // --- Downloads Screen -----------------------------------------------------------
 @Composable
-fun DownloadsScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
+fun DownloadsScreen(vm: MainViewModel, torrentVm: TorrentViewModel, modifier: Modifier = Modifier) {
     val context = LocalContext.current
     // visibleDownloads excludes items the user deleted (hiddenDownloadIds)
     val visibleDownloads = vm.downloadHistory.filter { it.id !in vm.hiddenDownloadIds }
@@ -1389,7 +1389,7 @@ fun DownloadsScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
             )
         }
 
-        // ── Active download progress card ──
+        // ── Active download progress card (regular media) ──
         AnimatedVisibility(
             visible = vm.isDownloading || vm.activeDownloadTitle.isNotBlank(),
             enter = expandVertically(tween(300)) + fadeIn(tween(250)),
@@ -1402,6 +1402,59 @@ fun DownloadsScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                 statusMessage = vm.statusMessage,
                 modifier = Modifier.padding(horizontal = 20.dp).padding(bottom = 12.dp)
             )
+        }
+
+        // ── Torrents section ──
+        val allTorrents = torrentVm.torrents
+        if (allTorrents.isNotEmpty()) {
+            // Section label
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp)
+                    .padding(bottom = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Outlined.Downloading,
+                        contentDescription = null,
+                        tint = Cyan,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        "TORRENTS",
+                        color = Cyan,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 1.sp
+                    )
+                }
+                Text(
+                    "${allTorrents.size} item${if (allTorrents.size == 1) "" else "s"}",
+                    color = TextTertiary,
+                    fontSize = 11.sp
+                )
+            }
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                allTorrents.forEach { torrent ->
+                    DownloadsTorrentRow(
+                        torrent = torrent,
+                        onOpenTorrentTab = { vm.currentNavTab = NavTab.TORRENT },
+                        onPause  = { torrentVm.pauseTorrent(torrent.infoHash) },
+                        onResume = { torrentVm.resumeTorrent(torrent.infoHash) },
+                        onCancel = { torrentVm.requestDelete(torrent.infoHash) }
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(12.dp))
         }
 
         if (vm.visibleDownloadsCount() == 0 && !vm.isDownloading) {
@@ -1835,10 +1888,231 @@ fun DownloadItem(
     }
 }
 
+// --- Downloads: compact torrent row composable ----------------------------------
+@Composable
+fun DownloadsTorrentRow(
+    torrent: TorrentItem,
+    onOpenTorrentTab: () -> Unit,
+    onPause: () -> Unit = {},
+    onResume: () -> Unit = {},
+    onCancel: () -> Unit = {},
+    modifier: Modifier = Modifier
+) {
+    val stateColor = when (torrent.state) {
+        TorrentState.DOWNLOADING, TorrentState.METADATA -> Cyan
+        TorrentState.FINISHED, TorrentState.SEEDING     -> Emerald
+        TorrentState.PAUSED                             -> Amber
+        TorrentState.ERROR                              -> Rose
+        TorrentState.CHECKING                           -> VioletLight
+        TorrentState.QUEUED                             -> TextTertiary
+    }
+    val stateLabel = when (torrent.state) {
+        TorrentState.DOWNLOADING -> "Downloading"
+        TorrentState.METADATA    -> "Metadata…"
+        TorrentState.FINISHED    -> "Completed"
+        TorrentState.SEEDING     -> "Seeding"
+        TorrentState.PAUSED      -> "Paused"
+        TorrentState.ERROR       -> "Error"
+        TorrentState.CHECKING    -> "Checking"
+        TorrentState.QUEUED      -> "Queued"
+    }
+    val isActive = torrent.state == TorrentState.DOWNLOADING ||
+                   torrent.state == TorrentState.METADATA   ||
+                   torrent.state == TorrentState.CHECKING
+    val showControls = torrent.state in listOf(
+        TorrentState.DOWNLOADING, TorrentState.METADATA,
+        TorrentState.PAUSED, TorrentState.ERROR
+    )
+
+    // ETA calculation
+    val etaSeconds: Long = if (isActive && torrent.downloadSpeed > 0L && torrent.totalSize > torrent.downloadedBytes)
+        (torrent.totalSize - torrent.downloadedBytes) / torrent.downloadSpeed else 0L
+    fun formatEta(s: Long): String {
+        if (s <= 0L) return ""
+        val h = s / 3600; val m = (s % 3600) / 60; val sec = s % 60
+        return when {
+            h > 0  -> "${h}h ${m}m"
+            m > 0  -> "${m}m ${sec}s"
+            else   -> "${sec}s"
+        }
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(SurfaceCard)
+            .border(1.dp, stateColor.copy(alpha = 0.15f), RoundedCornerShape(14.dp))
+            .clickable { onOpenTorrentTab() }
+            .padding(14.dp)
+    ) {
+        // Top row: icon + name + percent
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                modifier = Modifier
+                    .size(38.dp)
+                    .clip(RoundedCornerShape(9.dp))
+                    .background(stateColor.copy(alpha = 0.12f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = when (torrent.state) {
+                        TorrentState.FINISHED, TorrentState.SEEDING -> Icons.Outlined.CheckCircle
+                        TorrentState.PAUSED                         -> Icons.Outlined.PauseCircle
+                        TorrentState.ERROR                          -> Icons.Outlined.ErrorOutline
+                        else                                        -> Icons.Outlined.Downloading
+                    },
+                    contentDescription = null,
+                    tint = stateColor,
+                    modifier = Modifier.size(22.dp)
+                )
+            }
+            Spacer(modifier = Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    torrent.name,
+                    color = TextPrimary,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(4.dp))
+                            .background(stateColor.copy(alpha = 0.12f))
+                            .padding(horizontal = 5.dp, vertical = 2.dp)
+                    ) {
+                        Text(stateLabel, color = stateColor, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    }
+                    if (isActive && torrent.downloadSpeed > 0L) {
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            "↓ ${formatSpeed(torrent.downloadSpeed)}/s",
+                            color = TextTertiary,
+                            fontSize = 11.sp
+                        )
+                        if (etaSeconds > 0L) {
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                "• ${formatEta(etaSeconds)}",
+                                color = TextSecondary,
+                                fontSize = 11.sp
+                            )
+                        }
+                    } else if (torrent.totalSize > 0L) {
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            "${formatBytes(torrent.downloadedBytes)} / ${formatBytes(torrent.totalSize)}",
+                            color = TextTertiary,
+                            fontSize = 11.sp
+                        )
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                "${"%.0f".format(torrent.progress * 100)}%",
+                color = stateColor,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold
+            )
+        }
+
+        // Progress bar for active or paused
+        if (isActive || torrent.state == TorrentState.PAUSED) {
+            Spacer(modifier = Modifier.height(10.dp))
+            val animProg by animateFloatAsState(
+                torrent.progress.coerceIn(0f, 1f), tween(400), label = "dlTorrentProg"
+            )
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(5.dp)
+                    .clip(RoundedCornerShape(3.dp))
+                    .background(stateColor.copy(alpha = 0.1f))
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxHeight()
+                        .fillMaxWidth(animProg)
+                        .clip(RoundedCornerShape(3.dp))
+                        .background(stateColor)
+                )
+            }
+        }
+
+        // Action buttons
+        if (showControls) {
+            Spacer(modifier = Modifier.height(10.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (torrent.state == TorrentState.PAUSED) {
+                    // Resume button
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Emerald.copy(alpha = 0.12f))
+                            .border(1.dp, Emerald.copy(alpha = 0.2f), RoundedCornerShape(8.dp))
+                            .clickable { onResume() }
+                            .padding(vertical = 7.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Outlined.PlayArrow, null, tint = Emerald, modifier = Modifier.size(14.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("▶ Resume", color = Emerald, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                } else if (isActive) {
+                    // Pause button
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Amber.copy(alpha = 0.12f))
+                            .border(1.dp, Amber.copy(alpha = 0.2f), RoundedCornerShape(8.dp))
+                            .clickable { onPause() }
+                            .padding(vertical = 7.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Outlined.Pause, null, tint = Amber, modifier = Modifier.size(14.dp))
+                            Spacer(Modifier.width(4.dp))
+                            Text("⏸ Pause", color = Amber, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
+                // Cancel button
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(Rose.copy(alpha = 0.10f))
+                        .border(1.dp, Rose.copy(alpha = 0.18f), RoundedCornerShape(8.dp))
+                        .clickable { onCancel() }
+                        .padding(vertical = 7.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Outlined.Cancel, null, tint = Rose, modifier = Modifier.size(14.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("× Cancel", color = Rose, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
+        }
+    }
+}
+
 // --- History Screen -------------------------------------------------------------
 @Composable
-fun HistoryScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
-    val allHistory = vm.downloadHistory
+fun HistoryScreen(vm: MainViewModel, torrentVm: TorrentViewModel, modifier: Modifier = Modifier) {
     val visibleCount = vm.visibleHistoryCount()
 
     var searchQuery by remember { mutableStateOf("") }
@@ -1857,7 +2131,7 @@ fun HistoryScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
     ) {
-        // Header
+        // ── Header ──
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1876,12 +2150,11 @@ fun HistoryScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    "$visibleCount downloads logged",
+                    "$visibleCount download${if (visibleCount == 1) "" else "s"} · ${torrentVm.torrentSearchRecords.size} torrent search${if (torrentVm.torrentSearchRecords.size == 1) "" else "es"}",
                     color = TextTertiary,
                     fontSize = 13.sp
                 )
             }
-
             if (visibleCount > 0) {
                 Box(
                     modifier = Modifier
@@ -1901,8 +2174,9 @@ fun HistoryScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
             }
         }
 
-        if (visibleCount == 0) {
-            // Empty state
+        // ── Media download history ──
+        if (visibleCount == 0 && torrentVm.torrentSearchRecords.isEmpty()) {
+            // Complete empty state
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1931,29 +2205,22 @@ fun HistoryScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                     lineHeight = 20.sp
                 )
             }
-        } else {
-            // Search bar
+        } else if (visibleCount > 0) {
             SearchBar(
                 query = searchQuery,
                 onQueryChange = { searchQuery = it },
                 placeholder = "Search history…",
                 modifier = Modifier.padding(horizontal = 20.dp)
             )
-
             Spacer(modifier = Modifier.height(10.dp))
-
-            // Filter chips
             FilterChipsRow(
                 mediaFilter = vm.historyMediaFilter,
                 dateFilter = vm.historyDateFilter,
                 onMediaFilterChange = { vm.historyMediaFilter = it },
                 onDateFilterChange = { vm.historyDateFilter = it }
             )
-
             Spacer(modifier = Modifier.height(12.dp))
-
             if (filtered.isEmpty()) {
-                // No results after filtering/search
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -1974,20 +2241,17 @@ fun HistoryScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                     )
                 }
             } else {
-                // Group by date sections
                 val grouped = filtered.groupBy { record ->
                     val now = System.currentTimeMillis()
                     val diff = now - record.timestamp
                     when {
-                        diff < 86_400_000 -> "Today"
+                        diff < 86_400_000  -> "Today"
                         diff < 172_800_000 -> "Yesterday"
                         diff < 604_800_000 -> "This Week"
-                        else -> "Older"
+                        else               -> "Older"
                     }
                 }
-
                 grouped.forEach { (section, records) ->
-                    // Section header
                     Text(
                         section.uppercase(),
                         color = TextTertiary,
@@ -1996,7 +2260,6 @@ fun HistoryScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                         letterSpacing = 1.sp,
                         modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp)
                     )
-
                     Column(
                         modifier = Modifier.padding(horizontal = 20.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp)
@@ -2014,8 +2277,218 @@ fun HistoryScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                     }
                 }
             }
-
             Spacer(modifier = Modifier.height(24.dp))
+        }
+
+        // ── Torrent Search History (inside the scrollable Column) ──
+        if (torrentVm.torrentSearchRecords.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp)
+                    .padding(top = 4.dp, bottom = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Outlined.Downloading,
+                        contentDescription = null,
+                        tint = VioletLight,
+                        modifier = Modifier.size(14.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        "TORRENT SEARCHES",
+                        color = VioletLight,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 1.sp
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .clickable { torrentVm.clearTorrentSearchHistory() }
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                ) {
+                    Text("Clear", color = Rose.copy(alpha = 0.7f), fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+            Column(
+                modifier = Modifier.padding(horizontal = 20.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                torrentVm.torrentSearchRecords.forEach { record ->
+                    TorrentSearchRecordCard(
+                        record = record,
+                        onReSearch = {
+                            torrentVm.initiateSearch(record.query)
+                            vm.currentNavTab = NavTab.TORRENT
+                        },
+                        onAddResult = { snap ->
+                            val fakeResult = TorrentSearchResult(
+                                name           = snap.name,
+                                infoHash       = snap.infoHash,
+                                size           = snap.sizeBytes,
+                                seeders        = snap.seeders,
+                                leechers       = 0,
+                                category       = snap.category,
+                                addedTimestamp = 0L
+                            )
+                            torrentVm.addFromSearchResult(fakeResult)
+                            vm.currentNavTab = NavTab.TORRENT
+                        }
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(24.dp))
+        }
+
+        Spacer(modifier = Modifier.height(100.dp))
+    }
+}
+
+// --- Torrent Search Record Card ------------------------------------------------
+@Composable
+fun TorrentSearchRecordCard(
+    record: TorrentSearchRecord,
+    onReSearch: () -> Unit,
+    onAddResult: (TorrentSearchResultSnapshot) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var expanded by remember { mutableStateOf(false) }
+
+    fun relativeTime(ts: Long): String {
+        val diff = System.currentTimeMillis() - ts
+        return when {
+            diff < 60_000      -> "just now"
+            diff < 3_600_000   -> "${diff / 60_000}m ago"
+            diff < 86_400_000  -> "${diff / 3_600_000}h ago"
+            diff < 604_800_000 -> "${diff / 86_400_000}d ago"
+            else               -> "${diff / 604_800_000}w ago"
+        }
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(SurfaceCard)
+            .border(1.dp, VioletLight.copy(alpha = 0.12f), RoundedCornerShape(14.dp))
+    ) {
+        // Header row: tapping re-searches
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { onReSearch() }
+                .padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.Search,
+                contentDescription = null,
+                tint = VioletLight,
+                modifier = Modifier.size(18.dp)
+            )
+            Spacer(modifier = Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    record.query,
+                    color = TextPrimary,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(relativeTime(record.timestamp), color = TextTertiary, fontSize = 11.sp)
+                    if (record.resultCount > 0) {
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(VioletLight.copy(alpha = 0.12f))
+                                .padding(horizontal = 5.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                "${record.resultCount} results",
+                                color = VioletLight,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+            }
+            if (record.topResults.isNotEmpty()) {
+                Icon(
+                    imageVector = if (expanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
+                    contentDescription = if (expanded) "Collapse" else "Expand",
+                    tint = TextTertiary,
+                    modifier = Modifier
+                        .size(20.dp)
+                        .clickable { expanded = !expanded }
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+            }
+            Icon(
+                imageVector = Icons.Outlined.NorthWest,
+                contentDescription = "Re-search",
+                tint = VioletLight.copy(alpha = 0.5f),
+                modifier = Modifier.size(14.dp)
+            )
+        }
+
+        // Expanded: top results with Add buttons
+        AnimatedVisibility(visible = expanded && record.topResults.isNotEmpty()) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Ink2.copy(alpha = 0.5f))
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                record.topResults.forEach { snap ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                snap.name,
+                                color = TextSecondary,
+                                fontSize = 12.sp,
+                                maxLines = 2,
+                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    formatBytes(snap.sizeBytes),
+                                    color = TextTertiary,
+                                    fontSize = 10.sp
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("▲ ${snap.seeders}", color = Emerald.copy(alpha = 0.7f), fontSize = 10.sp)
+                            }
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(Cyan.copy(alpha = 0.12f))
+                                .border(1.dp, Cyan.copy(alpha = 0.2f), RoundedCornerShape(8.dp))
+                                .clickable { onAddResult(snap) }
+                                .padding(horizontal = 10.dp, vertical = 5.dp)
+                        ) {
+                            Text("↓ Add", color = Cyan, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                    }
+                }
+            }
         }
     }
 }

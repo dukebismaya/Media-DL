@@ -2,6 +2,25 @@ package com.bismaya.mediadl
 
 import android.content.Context
 import android.content.SharedPreferences
+import org.json.JSONArray
+import org.json.JSONObject
+
+// ── Snapshot of a single torrent search result (for history persistence) ────────
+data class TorrentSearchResultSnapshot(
+    val name: String,
+    val infoHash: String,
+    val sizeBytes: Long,
+    val seeders: Int,
+    val category: String
+)
+
+// ── A saved torrent search session ────────────────────────────────────────────────
+data class TorrentSearchRecord(
+    val query: String,
+    val timestamp: Long,
+    val resultCount: Int,
+    val topResults: List<TorrentSearchResultSnapshot>
+)
 
 data class TorrentPrefs(
     val downloadSpeedLimit: Int = 0,        // bytes/sec, 0 = unlimited
@@ -48,5 +67,58 @@ object TorrentSettingsManager {
             putBoolean("auto_queue_ram", settings.autoQueueOnLowRam)
             putString("save_path", settings.savePath)
         }.apply()
+    }
+
+    /** Torrent search records — persisted as JSON, max 25 entries. */
+    fun loadSearchRecords(context: Context): List<TorrentSearchRecord> {
+        val json = prefs(context).getString("torrent_search_records_v2", null)
+            ?: return emptyList()
+        return try {
+            val arr = JSONArray(json)
+            (0 until arr.length()).map { i ->
+                val o = arr.getJSONObject(i)
+                val topArr = o.getJSONArray("top")
+                TorrentSearchRecord(
+                    query       = o.getString("q"),
+                    timestamp   = o.getLong("ts"),
+                    resultCount = o.getInt("count"),
+                    topResults  = (0 until topArr.length()).map { j ->
+                        val r = topArr.getJSONObject(j)
+                        TorrentSearchResultSnapshot(
+                            name     = r.getString("n"),
+                            infoHash = r.getString("h"),
+                            sizeBytes = r.getLong("s"),
+                            seeders  = r.getInt("sd"),
+                            category = r.optString("cat", "")
+                        )
+                    }
+                )
+            }
+        } catch (_: Exception) { emptyList() }
+    }
+
+    fun saveSearchRecords(context: Context, records: List<TorrentSearchRecord>) {
+        val arr = JSONArray()
+        records.take(25).forEach { rec ->
+            arr.put(JSONObject().apply {
+                put("q",     rec.query)
+                put("ts",    rec.timestamp)
+                put("count", rec.resultCount)
+                val top = JSONArray()
+                rec.topResults.take(5).forEach { r ->
+                    top.put(JSONObject().apply {
+                        put("n",   r.name)
+                        put("h",   r.infoHash)
+                        put("s",   r.sizeBytes)
+                        put("sd",  r.seeders)
+                        put("cat", r.category)
+                    })
+                }
+                put("top", top)
+            })
+        }
+        prefs(context).edit()
+            .putString("torrent_search_records_v2", arr.toString())
+            .apply()
     }
 }
