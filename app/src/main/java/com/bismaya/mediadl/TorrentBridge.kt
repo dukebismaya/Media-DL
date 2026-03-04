@@ -40,6 +40,25 @@ object TorrentBridge {
         appContext = context.applicationContext
         engine = TorrentEngine.getInstance(appContext)
         infoProvider = TorrentInfoProvider.getInstance(appContext)
+        applyPerformanceDefaults()
+    }
+
+    /**
+     * Ensures connection/peer limits are set to values suited for a fast network.
+     * Only upgrades conservative defaults — never lowers values the user has raised.
+     */
+    private fun applyPerformanceDefaults() {
+        val repo = RepositoryHelper.getSettingsRepository(appContext)
+        // Per-torrent connections: 40 (original default) → 100
+        if (repo.maxConnectionsPerTorrent() <= 40) repo.maxConnectionsPerTorrent(100)
+        // Upload slots per torrent: 4 → 12 (reciprocity improves DL speed)
+        if (repo.maxUploadsPerTorrent() <= 4)      repo.maxUploadsPerTorrent(12)
+        // Global connection pool: 200 → 500
+        if (repo.maxConnections() <= 200)           repo.maxConnections(500)
+        // Active download / seed / total slot limits
+        if (repo.maxActiveDownloads() <= 4)         repo.maxActiveDownloads(8)
+        if (repo.maxActiveUploads() <= 4)           repo.maxActiveUploads(8)
+        if (repo.maxActiveTorrents() <= 6)          repo.maxActiveTorrents(15)
     }
 
     fun requireInit(context: Context) {
