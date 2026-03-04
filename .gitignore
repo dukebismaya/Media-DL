@@ -35,3 +35,6 @@ reference/
 # ── OS artifacts ────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+
+
+version-naming-system.md

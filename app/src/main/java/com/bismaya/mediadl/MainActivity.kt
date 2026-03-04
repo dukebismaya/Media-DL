@@ -574,6 +574,57 @@ fun MediaDLApp(
                 }
             }
         }
+
+        // ── Remove Torrent dialog — hoisted here so it shows on any tab ──
+        if (torrentVm.pendingDeleteHash != null) {
+            val name = torrentVm.torrents.find { it.infoHash == torrentVm.pendingDeleteHash }?.name ?: "this torrent"
+            AlertDialog(
+                onDismissRequest = { torrentVm.cancelDelete() },
+                containerColor = Ink3,
+                titleContentColor = TextPrimary,
+                textContentColor = TextSecondary,
+                title = { Text("Remove Torrent", fontWeight = FontWeight.Bold) },
+                text = {
+                    Column {
+                        Text("Remove \"$name\"?", fontSize = 14.sp)
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .clickable { torrentVm.pendingDeleteFiles = !torrentVm.pendingDeleteFiles }
+                                .padding(vertical = 4.dp)
+                        ) {
+                            Checkbox(
+                                checked = torrentVm.pendingDeleteFiles,
+                                onCheckedChange = { torrentVm.pendingDeleteFiles = it },
+                                colors = CheckboxDefaults.colors(
+                                    checkedColor = Rose,
+                                    uncheckedColor = TextTertiary,
+                                    checkmarkColor = TextPrimary
+                                )
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                "Also delete downloaded files",
+                                color = if (torrentVm.pendingDeleteFiles) Rose else TextSecondary,
+                                fontSize = 13.sp
+                            )
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { torrentVm.confirmDelete(torrentVm.pendingDeleteFiles) }) {
+                        Text("Remove", color = Rose, fontWeight = FontWeight.SemiBold)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { torrentVm.cancelDelete() }) {
+                        Text("Cancel", color = TextTertiary)
+                    }
+                }
+            )
+        }
     }
 }
 
@@ -2143,7 +2194,7 @@ fun DownloadsTorrentRow(
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(Icons.Outlined.PlayArrow, null, tint = Emerald, modifier = Modifier.size(14.dp))
                             Spacer(Modifier.width(4.dp))
-                            Text("▶ Resume", color = Emerald, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                            Text("Resume", color = Emerald, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                         }
                     }
                 } else if (isActive) {
@@ -2161,7 +2212,7 @@ fun DownloadsTorrentRow(
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Icon(Icons.Outlined.Pause, null, tint = Amber, modifier = Modifier.size(14.dp))
                             Spacer(Modifier.width(4.dp))
-                            Text("⏸ Pause", color = Amber, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                            Text("Pause", color = Amber, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                         }
                     }
                 }
@@ -2179,7 +2230,7 @@ fun DownloadsTorrentRow(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Outlined.Cancel, null, tint = Rose, modifier = Modifier.size(14.dp))
                         Spacer(Modifier.width(4.dp))
-                        Text("× Cancel", color = Rose, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                        Text("Cancel", color = Rose, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                     }
                 }
             }
@@ -3711,16 +3762,14 @@ fun AboutScreen(vm: MainViewModel, modifier: Modifier = Modifier) {
                     .background(Rose.copy(alpha = 0.08f))
                     .border(1.dp, Rose.copy(alpha = 0.20f), RoundedCornerShape(10.dp))
                     .clickable {
+                        val subject = "Bug Report | MediaDL v$versionName"
+                        val body = "Hi Bismaya,\n\nI found a bug in MediaDL:\n\n[Describe the issue here]\n\nSteps to reproduce:\n1. \n2. \n\nExpected behaviour:\n\nActual behaviour:\n\nDevice: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}\nAndroid: ${android.os.Build.VERSION.RELEASE}\nApp version: $versionName\n"
                         val intent = android.content.Intent(android.content.Intent.ACTION_SENDTO).apply {
-                            data = android.net.Uri.parse("mailto:")
-                            putExtra(android.content.Intent.EXTRA_EMAIL, arrayOf("dev.bismaya@gmail.com"))
-                            putExtra(android.content.Intent.EXTRA_SUBJECT, "MM-DL Bug Report")
-                            putExtra(android.content.Intent.EXTRA_TEXT,
-                                "Hi Bismaya,\n\nI found a bug in MM-DL:\n\n[Describe the issue here]\n\nDevice: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}\nAndroid: ${android.os.Build.VERSION.RELEASE}\nApp version: $versionName\n")
+                            data = android.net.Uri.parse("mailto:dev.bismaya@gmail.com")
+                            putExtra(android.content.Intent.EXTRA_SUBJECT, subject)
+                            putExtra(android.content.Intent.EXTRA_TEXT, body)
                         }
-                        if (intent.resolveActivity(context.packageManager) != null) {
-                            context.startActivity(intent)
-                        }
+                        context.startActivity(android.content.Intent.createChooser(intent, "Send bug report"))
                     }
                     .padding(horizontal = 14.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,

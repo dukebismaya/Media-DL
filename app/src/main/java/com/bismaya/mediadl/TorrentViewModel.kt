@@ -59,6 +59,11 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
         private set
     var searchError by mutableStateOf<String?>(null)
         private set
+    /** How many of the [searchProvidersTotal] providers have reported back so far. */
+    var searchProvidersDone by mutableStateOf(0)
+        private set
+    val searchProvidersTotal: Int = TorrentSearchProvider.PROVIDER_COUNT
+    private var searchJob: Job? = null
     val torrentSearchRecords = mutableStateListOf<TorrentSearchRecord>()
 
     // ── Search filters (applied client-side after results arrive) ──
@@ -459,36 +464,44 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
     fun searchTorrents() {
         val q = searchQuery.trim()
         if (q.isBlank()) return
-        isSearching = true; searchError = null; searchResults = emptyList()
-        viewModelScope.launch(Dispatchers.IO) {
-            val result = TorrentSearchProvider.search(q)
-            withContext(Dispatchers.Main) {
-                isSearching = false
-                result.fold(
-                    onSuccess = { results ->
-                        searchResults = results
-                        if (results.isEmpty()) {
-                            searchError = "No results found for \"$q\""
-                        } else {
-                            val snapshot = results.take(5).map { r ->
-                                TorrentSearchResultSnapshot(
-                                    name = r.name, infoHash = r.infoHash,
-                                    sizeBytes = r.size, seeders = r.seeders, category = r.category
-                                )
-                            }
-                            val record = TorrentSearchRecord(
-                                query = q, timestamp = System.currentTimeMillis(),
-                                resultCount = results.size, topResults = snapshot
-                            )
-                            torrentSearchRecords.removeAll { it.query.equals(q, ignoreCase = true) }
-                            torrentSearchRecords.add(0, record)
-                            if (torrentSearchRecords.size > 25)
-                                torrentSearchRecords.removeAt(torrentSearchRecords.size - 1)
-                            TorrentSettingsManager.saveSearchRecords(appContext, torrentSearchRecords.toList())
-                        }
-                    },
-                    onFailure = { e -> searchError = "Search failed: ${e.message}" }
+        searchJob?.cancel()                    // cancel any in-flight search immediately
+        isSearching = true
+        searchError = null
+        searchResults = emptyList()
+        searchProvidersDone = 0
+        searchJob = viewModelScope.launch {    // Main dispatcher — callbacks land here safely
+            var gotAny = false
+            TorrentSearchProvider.searchStreaming(
+                query = q,
+                onPartialResult = { partial ->
+                    gotAny = true
+                    searchResults = partial    // live update — UI recomposes immediately
+                },
+                onProgress = { done, _ ->
+                    searchProvidersDone = done
+                }
+            )
+            // All 9 providers have now finished (or been cancelled)
+            isSearching = false
+            if (!gotAny) {
+                searchError = "No results found for \"$q\""
+            } else {
+                val results = searchResults
+                val snapshot = results.take(5).map { r ->
+                    TorrentSearchResultSnapshot(
+                        name = r.name, infoHash = r.infoHash,
+                        sizeBytes = r.size, seeders = r.seeders, category = r.category
+                    )
+                }
+                val record = TorrentSearchRecord(
+                    query = q, timestamp = System.currentTimeMillis(),
+                    resultCount = results.size, topResults = snapshot
                 )
+                torrentSearchRecords.removeAll { it.query.equals(q, ignoreCase = true) }
+                torrentSearchRecords.add(0, record)
+                if (torrentSearchRecords.size > 25)
+                    torrentSearchRecords.removeAt(torrentSearchRecords.size - 1)
+                TorrentSettingsManager.saveSearchRecords(appContext, torrentSearchRecords.toList())
             }
         }
     }

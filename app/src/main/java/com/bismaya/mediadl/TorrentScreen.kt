@@ -165,57 +165,6 @@ fun TorrentScreen(
         Spacer(modifier = Modifier.height(100.dp))
     }
 
-    // ── Delete confirmation dialog ──
-    if (vm.pendingDeleteHash != null) {
-        val name = vm.torrents.find { it.infoHash == vm.pendingDeleteHash }?.name ?: "this torrent"
-        AlertDialog(
-            onDismissRequest = { vm.cancelDelete() },
-            containerColor = Ink3,
-            titleContentColor = TextPrimary,
-            textContentColor = TextSecondary,
-            title = { Text("Remove Torrent", fontWeight = FontWeight.Bold) },
-            text = {
-                Column {
-                    Text("Remove \"$name\"?", fontSize = 14.sp)
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(8.dp))
-                            .clickable { vm.pendingDeleteFiles = !vm.pendingDeleteFiles }
-                            .padding(vertical = 4.dp)
-                    ) {
-                        Checkbox(
-                            checked = vm.pendingDeleteFiles,
-                            onCheckedChange = { vm.pendingDeleteFiles = it },
-                            colors = CheckboxDefaults.colors(
-                                checkedColor = Rose,
-                                uncheckedColor = TextTertiary,
-                                checkmarkColor = TextPrimary
-                            )
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            "Also delete downloaded files",
-                            color = if (vm.pendingDeleteFiles) Rose else TextSecondary,
-                            fontSize = 13.sp
-                        )
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { vm.confirmDelete(vm.pendingDeleteFiles) }) {
-                    Text("Remove", color = Rose, fontWeight = FontWeight.SemiBold)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { vm.cancelDelete() }) {
-                    Text("Cancel", color = TextTertiary)
-                }
-            }
-        )
-    }
-
     // ── Settings bottom sheet ──
     if (vm.showSettings) {
         TorrentSettingsSheet(
@@ -518,7 +467,26 @@ private fun SearchTabContent(vm: TorrentViewModel) {
     }
 
     // ── Results ──
-    if (vm.searchResults.isEmpty() && !vm.isSearching && vm.searchError == null) {
+
+    // Searching but no results yet — show animated provider progress
+    if (vm.isSearching && vm.searchResults.isEmpty()) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(top = 60.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            CircularProgressIndicator(color = VioletLight, modifier = Modifier.size(44.dp), strokeWidth = 3.dp)
+            Spacer(modifier = Modifier.height(20.dp))
+            Text(
+                "Searching ${vm.searchProvidersDone}/${vm.searchProvidersTotal} sources…",
+                color = TextSecondary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                "Results appear as each source responds",
+                color = TextTertiary, fontSize = 13.sp
+            )
+        }
+    } else if (!vm.isSearching && vm.searchResults.isEmpty() && vm.searchError == null) {
         Column(
             modifier = Modifier.fillMaxWidth().padding(top = 60.dp),
             horizontalAlignment = Alignment.CenterHorizontally
@@ -533,9 +501,18 @@ private fun SearchTabContent(vm: TorrentViewModel) {
             )
         }
     } else if (vm.searchResults.isNotEmpty()) {
+        // While still streaming results, show a subtle top progress bar
+        if (vm.isSearching) {
+            LinearProgressIndicator(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
+                color = VioletLight,
+                trackColor = VioletLight.copy(alpha = 0.12f)
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+        }
 
         // ── Filter chips ──
-        val categories = listOf("All", "Video", "Audio", "Games", "Apps", "Other")
+        val categories = listOf("All", "Video", "Audio", "Anime", "Games", "Apps", "Other")
         val sizeFilters = listOf("Any", "<100 MB", "100 MB–1 GB", ">1 GB")
 
         // Category filter row
@@ -547,7 +524,8 @@ private fun SearchTabContent(vm: TorrentViewModel) {
             items(categories) { cat ->
                 val selected = vm.searchCategoryFilter == cat
                 val chipColor = when (cat) {
-                    "Video" -> Cyan; "Audio" -> VioletLight; "Games" -> Emerald; "Apps" -> Amber; "Other" -> TextTertiary; else -> Violet
+                    "Video" -> Cyan; "Audio" -> VioletLight; "Anime" -> Rose
+                    "Games" -> Emerald; "Apps" -> Amber; "Other" -> TextTertiary; else -> Violet
                 }
                 Box(
                     modifier = Modifier
@@ -601,8 +579,9 @@ private fun SearchTabContent(vm: TorrentViewModel) {
             catOk && sizeOk
         }
 
+        val streamingLabel = if (vm.isSearching) " · ${vm.searchProvidersDone}/${vm.searchProvidersTotal} sources" else ""
         Text(
-            "${filteredResults.size} results${if (filteredResults.size != vm.searchResults.size) " (filtered from ${vm.searchResults.size})" else ""}",
+            "${filteredResults.size} results${if (filteredResults.size != vm.searchResults.size) " (filtered from ${vm.searchResults.size})" else ""}$streamingLabel",
             color = TextTertiary,
             fontSize = 12.sp,
             modifier = Modifier.padding(horizontal = 20.dp)
@@ -700,6 +679,9 @@ private fun SearchResultCard(
                                 "TorrCSV" -> Emerald
                                 "Solid"   -> Color(0xFFAB47BC)
                                 "Nyaa"    -> Rose
+                                "Bitsrch" -> Color(0xFF00BCD4)
+                                "Torrntz" -> Color(0xFFFF7043)
+                                "LimeTrr" -> Color(0xFF66BB6A)
                                 else      -> TextTertiary
                             }
                             Spacer(modifier = Modifier.width(6.dp))
