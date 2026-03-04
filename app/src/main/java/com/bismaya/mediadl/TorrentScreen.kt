@@ -362,7 +362,7 @@ private fun ActiveTabContent(vm: TorrentViewModel, onPickFile: () -> Unit) {
         Spacer(modifier = Modifier.width(6.dp))
         Text(
             if (vm.settings.savePath.isNotBlank()) vm.settings.savePath.replace("/storage/emulated/0/", "")
-            else "Downloads/MediaDL/Torrents",
+            else "Private storage · Torrents (app-only)",
             color = TextTertiary, fontSize = 12.sp
         )
     }
@@ -1002,6 +1002,7 @@ private fun TorrentExpandedPanel(
     onOpen: () -> Unit,
     vm: TorrentViewModel
 ) {
+    val context = LocalContext.current
     // tab selection: 0=Info, 1=Files, 2=Trackers, 3=Peers
     var selectedTab by remember { mutableIntStateOf(0) }
     val tabs = listOf("Info", "Files", "Trackers", "Peers")
@@ -1238,7 +1239,8 @@ private fun TorrentExpandedPanel(
                                 else
                                     selectedIndices + file.index
                             },
-                            onToggle = { onToggleFile(file.index) }
+                            onToggle = { onToggleFile(file.index) },
+                            onStream = { vm.streamFile(context, item.infoHash, file.index) }
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                     }
@@ -1434,7 +1436,8 @@ private fun TorrentFileRow(
     isSelected: Boolean,
     selectionMode: Boolean,
     onSelect: () -> Unit,
-    onToggle: () -> Unit
+    onToggle: () -> Unit,
+    onStream: () -> Unit = {}
 ) {
     val isEnabled = file.priority > 0
     val ext = file.name.substringAfterLast('.', "").lowercase()
@@ -1521,6 +1524,23 @@ private fun TorrentFileRow(
                     "${formatBytes(file.size)} · ${"%.0f".format(file.progress * 100)}%",
                     color = TextTertiary,
                     fontSize = 10.sp
+                )
+            }
+        }
+        // Stream button — shown for video/audio files in normal (non-selection) mode
+        val isStreamable = !selectionMode && ext in setOf("mp4", "mkv", "avi", "webm", "mov",
+            "mp3", "flac", "ogg", "m4a", "wav", "aac") && file.progress > 0.01f
+        if (isStreamable) {
+            Spacer(modifier = Modifier.width(4.dp))
+            IconButton(
+                onClick = onStream,
+                modifier = Modifier.size(28.dp)
+            ) {
+                Icon(
+                    Icons.Outlined.PlayCircle,
+                    contentDescription = "Stream",
+                    tint = Cyan,
+                    modifier = Modifier.size(20.dp)
                 )
             }
         }

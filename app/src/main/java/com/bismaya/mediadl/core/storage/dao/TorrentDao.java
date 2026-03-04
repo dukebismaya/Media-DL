@@ -74,4 +74,10 @@ public abstract class TorrentDao {
 
     @Delete
     public abstract void deleteTag(TorrentTagInfo info);
+
+    @Query("UPDATE Torrent SET completedAndPaused = :value WHERE id = :id")
+    public abstract void setCompletedAndPaused(String id, boolean value);
+
+    @Query("SELECT id FROM Torrent WHERE completedAndPaused = 1")
+    public abstract List<String> getCompletedAndPausedIds();
 }

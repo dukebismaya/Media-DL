@@ -48,7 +48,7 @@ import com.bismaya.mediadl.core.storage.dao.TorrentDao;
                 TagInfo.class,
                 TorrentTagInfo.class,
         },
-        version = 9
+        version = 10
 )
 @TypeConverters({UriConverter.class})
 

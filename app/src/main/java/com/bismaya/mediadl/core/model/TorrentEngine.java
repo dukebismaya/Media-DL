@@ -491,6 +491,32 @@ public class TorrentEngine {
                 .subscribe());
     }
 
+    /** Explicitly pause a single torrent (no-op if already paused). */
+    public void pauseTorrent(@NonNull String id) {
+        disposables.add(Completable.fromRunnable(() -> {
+                    TorrentDownload task = session.getTask(id);
+                    if (task == null || task.isPaused())
+                        return;
+                    try {
+                        task.pauseManually();
+                    } catch (Exception e) { /* Ignore */ }
+                }).subscribeOn(Schedulers.io())
+                .subscribe());
+    }
+
+    /** Explicitly resume a single torrent (no-op if already running). */
+    public void resumeTorrent(@NonNull String id) {
+        disposables.add(Completable.fromRunnable(() -> {
+                    TorrentDownload task = session.getTask(id);
+                    if (task == null || !task.isPaused())
+                        return;
+                    try {
+                        task.resumeManually();
+                    } catch (Exception e) { /* Ignore */ }
+                }).subscribeOn(Schedulers.io())
+                .subscribe());
+    }
+
     public void forceRecheckTorrents(@NonNull List<String> ids) {
         disposables.add(Observable.fromIterable(ids)
                 .filter(Objects::nonNull)

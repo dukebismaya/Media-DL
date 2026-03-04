@@ -67,6 +67,8 @@ public class Torrent implements Parcelable {
     public boolean downloadingMetadata = false;
     public int visibility = VISIBILITY_VISIBLE_NOTIFY_FINISHED;
     public boolean firstLastPiecePriority;
+    /* True when this torrent was auto-paused after seeding completed */
+    public boolean completedAndPaused = false;
 
     @Ignore
     public Torrent(@NonNull String id,
@@ -113,6 +115,7 @@ public class Torrent implements Parcelable {
         visibility = source.readInt();
         sequentialDownload = source.readByte() != 0;
         firstLastPiecePriority = source.readByte() != 0;
+        completedAndPaused = source.readByte() != 0;
     }
 
     public boolean isDownloadingMetadata() {
@@ -146,6 +149,7 @@ public class Torrent implements Parcelable {
         dest.writeInt(visibility);
         dest.writeByte((byte) (sequentialDownload ? 1 : 0));
         dest.writeByte((byte) (firstLastPiecePriority ? 1 : 0));
+        dest.writeByte((byte) (completedAndPaused ? 1 : 0));
     }
 
     public static final Creator<Torrent> CREATOR = new Creator<>() {

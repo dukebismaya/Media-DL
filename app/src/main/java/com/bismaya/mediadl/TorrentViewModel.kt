@@ -3,11 +3,9 @@ package com.bismaya.mediadl
 import android.app.Application
 import android.content.Context
 import android.content.Intent
-import android.media.MediaScannerConnection
 import android.net.Uri
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
-import android.os.Environment
 import android.os.PowerManager
 import android.util.Log
 import androidx.compose.runtime.getValue
@@ -85,10 +83,11 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
             val base = if (settings.savePath.isNotBlank()) {
                 File(settings.savePath)
             } else {
-                File(
-                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                    "MediaDL/Torrents"
-                )
+                // App-private external storage: not indexed by MediaStore, not accessible
+                // to other apps without root.  Falls back to internal storage if SD is
+                // unavailable.  Path: Android/data/com.bismaya.mediadl/files/Torrents
+                appContext.getExternalFilesDir("Torrents")
+                    ?: File(appContext.filesDir, "Torrents")
             }
             if (!base.exists()) base.mkdirs()
             return base
@@ -106,6 +105,7 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
 
     private val notifiedComplete: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private var observerJob: Job? = null
+    private val torrentRepo by lazy { RepositoryHelper.getTorrentRepository(appContext) }
 
     // ── Completed-torrent persistence ──
     private val completedPrefs
@@ -115,13 +115,36 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
         completedPrefs.edit().putStringSet("hashes", autoPausedForSeeding.toSet()).apply()
     }
 
+    /** Persists [hash] as completed-and-paused in both SharedPrefs (legacy) and Room. */
+    private fun markCompletedAndPaused(hash: String) {
+        persistCompletedSet()
+        viewModelScope.launch(Dispatchers.IO) {
+            try { torrentRepo.setCompletedAndPaused(hash, true) } catch (_: Exception) {}
+        }
+    }
+
     // ── Init ──
     init {
         try {
             loadSettings()
-            // Restore hashes that survived app kill
+            // Restore hashes from SharedPrefs immediately (synchronous, backward-compat)
             val saved = completedPrefs.getStringSet("hashes", emptySet()) ?: emptySet()
             autoPausedForSeeding.addAll(saved)
+            // Also load from Room (the durable source of truth) and migrate any
+            // SharedPrefs-only hashes into Room for a clean transition.
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    val roomIds = torrentRepo.getCompletedAndPausedIds().toSet()
+                    autoPausedForSeeding.addAll(roomIds)
+                    for (hash in saved) {
+                        if (hash !in roomIds) {
+                            try { torrentRepo.setCompletedAndPaused(hash, true) } catch (_: Exception) {}
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e("TorrentVM", "Room completedAndPaused load failed", e)
+                }
+            }
             startEngine()
         } catch (e: Exception) {
             Log.e("TorrentVM", "Init failed", e)
@@ -174,28 +197,15 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
                     val isNewlySeeding = item.state == TorrentState.SEEDING && prevState != TorrentState.SEEDING
                     val isNewlyFinished = item.state == TorrentState.FINISHED && prevState != TorrentState.FINISHED
 
-                    // Trigger MediaStore scan so gallery picks up .mkv and other files
-                    if (isNewlySeeding || isNewlyFinished) {
-                        val scanRoot = defaultSaveDir
-                        val filePaths = scanRoot.walkTopDown()
-                            .filter { it.isFile }
-                            .map { it.absolutePath }
-                            .toList()
-                            .toTypedArray()
-                        if (filePaths.isNotEmpty()) {
-                            MediaScannerConnection.scanFile(appContext, filePaths, null, null)
-                        }
-                    }
-
                     if (isNewlySeeding && prefs.stopSeedingOnComplete && item.infoHash !in autoPausedForSeeding) {
                         autoPausedForSeeding.add(item.infoHash)
-                        persistCompletedSet()
+                        markCompletedAndPaused(item.infoHash)
                         TorrentBridge.pauseTorrent(item.infoHash)
                     }
                     if (item.state == TorrentState.SEEDING && prefs.maxSeedRatio > 0f &&
                         item.shareRatio >= prefs.maxSeedRatio && item.infoHash !in autoPausedForSeeding) {
                         autoPausedForSeeding.add(item.infoHash)
-                        persistCompletedSet()
+                        markCompletedAndPaused(item.infoHash)
                         TorrentBridge.pauseTorrent(item.infoHash)
                     }
                 }
@@ -331,12 +341,17 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
 
     fun confirmDelete(deleteFiles: Boolean) {
         val hash = pendingDeleteHash ?: return
+        // Optimistic UI removal — engine will also remove from Room asynchronously.
+        torrents.removeAll { it.infoHash == hash }
+        notifiedComplete.remove(hash)
+        autoPausedForSeeding.remove(hash)
+        prevTorrentStates.remove(hash)
+        persistCompletedSet()
+        pendingDeleteHash = null
+        pendingDeleteFiles = false
         viewModelScope.launch(Dispatchers.IO) {
             TorrentBridge.deleteTorrents(listOf(hash), deleteFiles)
         }
-        torrents.removeAll { it.infoHash == hash }
-        pendingDeleteHash = null
-        pendingDeleteFiles = false
     }
 
     fun cancelDelete() { pendingDeleteHash = null; pendingDeleteFiles = false }
@@ -428,15 +443,6 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
                         File(saveRoot, "${hash.take(8)}/${fi.name}")
                     )
                     candidates.firstOrNull { it.exists() }?.delete()
-                }
-                // Re-scan folder so gallery is updated
-                val filePaths = saveRoot.walkTopDown()
-                    .filter { it.isFile }
-                    .map { it.absolutePath }
-                    .toList()
-                    .toTypedArray()
-                if (filePaths.isNotEmpty()) {
-                    MediaScannerConnection.scanFile(appContext, filePaths, null, null)
                 }
             } catch (e: Exception) {
                 Log.e("TorrentVM", "deleteSelectedFiles failed", e)
@@ -534,7 +540,12 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
     fun updateSettings(newSettings: TorrentPrefs) {
         settings = newSettings
         TorrentSettingsManager.save(appContext, newSettings)
+        // Sync speed limits → engine SessionSettings via SettingsRepository (triggers handleSettingsChanged)
         TorrentBridge.setSpeedLimits(newSettings.downloadSpeedLimit, newSettings.uploadSpeedLimit)
+        // Sync active slot limits → engine SessionSettings
+        TorrentBridge.setActiveLimits(newSettings.maxActiveDownloads, newSettings.maxActiveSeeds)
+        // Sync IP filter toggle → engine session
+        TorrentBridge.setIpFiltering(newSettings.enableIpFiltering)
         // Sync save path to libretorrent's SettingsRepository
         if (newSettings.savePath.isNotBlank()) {
             RepositoryHelper.getSettingsRepository(appContext)
@@ -543,6 +554,25 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
         // Reset auto-pause cache when seeding settings change
         autoPausedForSeeding.clear()
         persistCompletedSet()
+    }
+
+    /**
+     * Open a specific torrent file in an external media player via the streaming server.
+     * The embedded NanoHTTPD server (default http://127.0.0.1:8800) must be running.
+     * Returns false if streaming is unavailable or the URL cannot be built.
+     */
+    fun streamFile(context: Context, torrentId: String, fileIndex: Int): Boolean {
+        val url = TorrentBridge.getStreamUrl(torrentId, fileIndex) ?: return false
+        return try {
+            val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+            true
+        } catch (e: Exception) {
+            Log.e("TorrentVM", "streamFile failed for $url", e)
+            false
+        }
     }
 
     private fun checkBatteryOptimization() {

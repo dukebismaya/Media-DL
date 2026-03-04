@@ -161,11 +161,11 @@ object TorrentBridge {
 
     fun pauseResume(torrentId: String) = engine.pauseResumeTorrent(torrentId)
 
-    /** Pause a single torrent (manual pause — persists across session restarts). */
-    fun pauseTorrent(torrentId: String) = engine.pauseResumeTorrent(torrentId)
+    /** Pause a single torrent (no-op if already paused; sets manuallyPaused in Room). */
+    fun pauseTorrent(torrentId: String) = engine.pauseTorrent(torrentId)
 
-    /** Resume a single torrent (manual resume). */
-    fun resumeTorrent(torrentId: String) = engine.pauseResumeTorrent(torrentId)
+    /** Resume a single torrent (no-op if already running; clears manuallyPaused in Room). */
+    fun resumeTorrent(torrentId: String) = engine.resumeTorrent(torrentId)
 
     fun deleteTorrents(ids: List<String>, withFiles: Boolean) =
         engine.deleteTorrents(ids, withFiles)
@@ -221,6 +221,36 @@ object TorrentBridge {
         val repo = com.bismaya.mediadl.core.RepositoryHelper.getSettingsRepository(appContext)
         repo.maxDownloadSpeedLimit(downloadLimit)
         repo.maxUploadSpeedLimit(uploadLimit)
+    }
+
+    /** Sync max active download / upload slot counts to the engine's SessionSettings. */
+    fun setActiveLimits(maxDownloads: Int, maxUploads: Int) {
+        val repo = com.bismaya.mediadl.core.RepositoryHelper.getSettingsRepository(appContext)
+        repo.maxActiveDownloads(maxDownloads)
+        repo.maxActiveUploads(maxUploads)
+    }
+
+    /** Enable or disable the IP blocklist filter in the engine. */
+    fun setIpFiltering(enabled: Boolean) {
+        com.bismaya.mediadl.core.RepositoryHelper.getSettingsRepository(appContext)
+            .enableIpFiltering(enabled)
+    }
+
+    /**
+     * Returns an HTTP URL that can be used to stream a specific file from a torrent
+     * through the embedded NanoHTTPD server (http://127.0.0.1:8800 by default).
+     * Returns null if streaming is disabled or the engine is not running.
+     */
+    fun getStreamUrl(torrentId: String, fileIndex: Int): String? {
+        if (!::engine.isInitialized || !engine.isRunning) return null
+        val repo = com.bismaya.mediadl.core.RepositoryHelper.getSettingsRepository(appContext)
+        if (!repo.enableStreaming()) return null
+        return com.bismaya.mediadl.core.model.stream.TorrentStreamServer.makeStreamUrl(
+            repo.streamingHostname(),
+            repo.streamingPort(),
+            torrentId,
+            fileIndex
+        )
     }
 
     // ── Trackers ───────────────────────────────────────────────────────────────
@@ -317,20 +347,25 @@ object TorrentBridge {
      * Convert a libretorrent [TorrentInfo] to the UI-facing [TorrentItem].
      */
     fun TorrentInfo.toItem(): TorrentItem = TorrentItem(
-        infoHash       = torrentId,
-        name           = name ?: torrentId,
-        totalSize      = totalBytes,
-        downloadedBytes = receivedBytes,
-        totalSentBytes  = uploadedBytes,
-        progress        = progress / 100f,
-        progressPct     = progress,
-        downloadSpeed   = downloadSpeed,
-        uploadSpeed     = uploadSpeed,
-        seeders         = 0,
-        peers           = totalPeers,
-        connectedPeers  = peers,
-        state           = stateCode?.toUiState() ?: TorrentState.UNKNOWN,
-        etaSec          = if (ETA >= TorrentInfo.MAX_ETA) Long.MAX_VALUE else ETA,
-        error           = error
+        infoHash               = torrentId,
+        name                   = name ?: torrentId,
+        totalSize              = totalBytes,
+        downloadedBytes        = receivedBytes,
+        totalSentBytes         = uploadedBytes,
+        progress               = progress / 100f,
+        progressPct            = progress,
+        downloadSpeed          = downloadSpeed,
+        uploadSpeed            = uploadSpeed,
+        seeders                = 0,
+        peers                  = totalPeers,
+        connectedPeers         = peers,
+        state                  = stateCode?.toUiState() ?: TorrentState.UNKNOWN,
+        etaSec                 = if (ETA >= TorrentInfo.MAX_ETA) Long.MAX_VALUE else ETA,
+        error                  = error,
+        isSequential           = sequentialDownload,
+        firstLastPiecePriority = firstLastPiecePriority,
+        // Share ratio: uploaded / max(1, downloaded) — mirrors TorrentDownloadImpl.getShareRatio()
+        shareRatio             = if (receivedBytes > 0L) uploadedBytes.toDouble() / receivedBytes.toDouble() else 0.0,
+        totalWanted            = totalBytes,
     )
 }

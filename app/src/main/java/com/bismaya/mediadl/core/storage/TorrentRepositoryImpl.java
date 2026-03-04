@@ -145,4 +145,14 @@ public class TorrentRepositoryImpl implements TorrentRepository {
     public void deleteTag(@NonNull String torrentId, @NonNull TagInfo tag) {
         db.torrentDao().deleteTag(new TorrentTagInfo(tag.id, torrentId));
     }
+
+    @Override
+    public void setCompletedAndPaused(@NonNull String torrentId, boolean value) {
+        db.torrentDao().setCompletedAndPaused(torrentId, value);
+    }
+
+    @Override
+    public List<String> getCompletedAndPausedIds() {
+        return db.torrentDao().getCompletedAndPausedIds();
+    }
 }

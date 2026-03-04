@@ -60,4 +60,8 @@ public interface TorrentRepository
     void addTag(@NonNull String torrentId, @NonNull TagInfo tag);
 
     void deleteTag(@NonNull String torrentId, @NonNull TagInfo tag);
+
+    void setCompletedAndPaused(@NonNull String torrentId, boolean value);
+
+    List<String> getCompletedAndPausedIds();
 }
