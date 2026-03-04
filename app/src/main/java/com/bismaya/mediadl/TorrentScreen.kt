@@ -1240,7 +1240,7 @@ private fun TorrentExpandedPanel(
                                     selectedIndices + file.index
                             },
                             onToggle = { onToggleFile(file.index) },
-                            onStream = { vm.streamFile(context, item.infoHash, file.index) }
+                            onStream = { vm.streamFile(context, item.infoHash, file.index, file.name) }
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                     }
@@ -1674,7 +1674,7 @@ private fun TorrentSettingsSheet(
                 Column(modifier = Modifier.weight(1f)) {
                     Text("Download Folder", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium)
                     Text(
-                        pickedPath.ifBlank { "Downloads/MediaDL/Torrents (default)" }
+                        pickedPath.ifBlank { "Private storage · Torrents (app-only)" }
                             .replace("/storage/emulated/0/", ""),
                         color = TextTertiary, fontSize = 11.sp,
                         maxLines = 1, overflow = TextOverflow.Ellipsis

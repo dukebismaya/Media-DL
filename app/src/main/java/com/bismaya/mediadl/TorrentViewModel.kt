@@ -558,16 +558,35 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
 
     /**
      * Open a specific torrent file in an external media player via the streaming server.
-     * The embedded NanoHTTPD server (default http://127.0.0.1:8800) must be running.
-     * Returns false if streaming is unavailable or the URL cannot be built.
+     * [fileName] is used to derive the MIME type so Android routes to a media player
+     * instead of a browser.  Returns false if streaming is unavailable.
      */
-    fun streamFile(context: Context, torrentId: String, fileIndex: Int): Boolean {
+    fun streamFile(context: Context, torrentId: String, fileIndex: Int, fileName: String): Boolean {
         val url = TorrentBridge.getStreamUrl(torrentId, fileIndex) ?: return false
+        val ext = fileName.substringAfterLast('.', "").lowercase()
+        val mime = when (ext) {
+            "mp4"              -> "video/mp4"
+            "mkv"              -> "video/x-matroska"
+            "avi"              -> "video/x-msvideo"
+            "webm"             -> "video/webm"
+            "mov"              -> "video/quicktime"
+            "mp3"              -> "audio/mpeg"
+            "flac"             -> "audio/flac"
+            "ogg"              -> "audio/ogg"
+            "m4a"              -> "audio/mp4"
+            "wav"              -> "audio/wav"
+            "aac"              -> "audio/aac"
+            else               -> "video/*"        // fallback — still picks a player not Chrome
+        }
         return try {
-            val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)).apply {
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(android.net.Uri.parse(url), mime)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-            context.startActivity(intent)
+            // Show chooser so the user can pick VLC, MX Player, built-in player, etc.
+            context.startActivity(Intent.createChooser(intent, "Open with").apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            })
             true
         } catch (e: Exception) {
             Log.e("TorrentVM", "streamFile failed for $url", e)
