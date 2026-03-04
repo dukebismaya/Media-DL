@@ -432,6 +432,7 @@ private fun ActiveTabContent(vm: TorrentViewModel, onPickFile: () -> Unit) {
 
 @Composable
 private fun SearchTabContent(vm: TorrentViewModel) {
+    val context = LocalContext.current
     val keyboard = LocalSoftwareKeyboardController.current
 
     // ── Search input ──
@@ -612,6 +613,16 @@ private fun SearchTabContent(vm: TorrentViewModel) {
             SearchResultCard(
                 result = result,
                 onDownload = { vm.addFromSearchResult(result) },
+                onOpenExternal = {
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(result.magnetUri)).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    try {
+                        context.startActivity(Intent.createChooser(intent, "Open magnet with…").apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        })
+                    } catch (_: Exception) {}
+                },
                 modifier = Modifier.padding(horizontal = 20.dp).padding(bottom = 10.dp)
             )
         }
@@ -626,6 +637,7 @@ private fun SearchTabContent(vm: TorrentViewModel) {
 private fun SearchResultCard(
     result: TorrentSearchResult,
     onDownload: () -> Unit,
+    onOpenExternal: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val catColor = when (result.category) {
@@ -709,7 +721,20 @@ private fun SearchResultCard(
 
                 Spacer(modifier = Modifier.weight(1f))
 
-                // Download button
+                // Open in external torrent app (µTorrent, BitTorrent, TorrDroid, etc.)
+                Box(
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(Cyan.copy(alpha = 0.12f))
+                        .border(1.dp, Cyan.copy(alpha = 0.25f), RoundedCornerShape(8.dp))
+                        .clickable { onOpenExternal() },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(Icons.Outlined.OpenInNew, "Open in external app", tint = Cyan, modifier = Modifier.size(16.dp))
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                // Download in-app button
                 Row(
                     modifier = Modifier
                         .clip(RoundedCornerShape(10.dp))
