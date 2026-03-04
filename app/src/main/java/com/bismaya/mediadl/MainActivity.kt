@@ -1473,7 +1473,60 @@ fun DownloadsScreen(vm: MainViewModel, torrentVm: TorrentViewModel, modifier: Mo
             Spacer(modifier = Modifier.height(12.dp))
         }
 
-        if (vm.visibleDownloadsCount() == 0 && !vm.isDownloading) {
+        // ── Completed torrents — always visible regardless of youtube-dl downloads ──
+        if (completedTorrents.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp)
+                    .padding(bottom = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Outlined.CheckCircle,
+                        contentDescription = null,
+                        tint = Emerald,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        "COMPLETED TORRENTS",
+                        color = Emerald,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 1.sp
+                    )
+                }
+                Text(
+                    "${completedTorrents.size} item${if (completedTorrents.size == 1) "" else "s"}",
+                    color = TextTertiary,
+                    fontSize = 11.sp
+                )
+            }
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                completedTorrents.forEach { torrent ->
+                    DownloadsTorrentRow(
+                        torrent = torrent,
+                        autoPausedHashes = autoPausedHashes,
+                        onOpenTorrentTab = { vm.currentNavTab = NavTab.TORRENT },
+                        onPause  = {},
+                        onResume = { torrentVm.resumeTorrent(torrent.infoHash) },
+                        onCancel = { torrentVm.requestDelete(torrent.infoHash) }
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+        }
+
+        if (vm.visibleDownloadsCount() == 0 && !vm.isDownloading && completedTorrents.isEmpty()) {
             // Empty state
             Column(
                 modifier = Modifier
@@ -1550,58 +1603,6 @@ fun DownloadsScreen(vm: MainViewModel, torrentVm: TorrentViewModel, modifier: Mo
                 onMediaFilterChange = { vm.downloadsMediaFilter = it },
                 onDateFilterChange = { vm.downloadsDateFilter = it }
             )
-
-            // ── Completed torrents section (below search bar) ──
-            if (completedTorrents.isNotEmpty()) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 20.dp)
-                        .padding(bottom = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            imageVector = Icons.Outlined.CheckCircle,
-                            contentDescription = null,
-                            tint = Emerald,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            "COMPLETED TORRENTS",
-                            color = Emerald,
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Bold,
-                            letterSpacing = 1.sp
-                        )
-                    }
-                    Text(
-                        "${completedTorrents.size} item${if (completedTorrents.size == 1) "" else "s"}",
-                        color = TextTertiary,
-                        fontSize = 11.sp
-                    )
-                }
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 20.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    completedTorrents.forEach { torrent ->
-                        DownloadsTorrentRow(
-                            torrent = torrent,
-                            autoPausedHashes = autoPausedHashes,
-                            onOpenTorrentTab = { vm.currentNavTab = NavTab.TORRENT },
-                            onPause  = {},
-                            onResume = { torrentVm.resumeTorrent(torrent.infoHash) },
-                            onCancel = { torrentVm.requestDelete(torrent.infoHash) }
-                        )
-                    }
-                }
-                Spacer(modifier = Modifier.height(12.dp))
-            }
 
             if (filtered.isEmpty()) {
                 // No results after filtering/search

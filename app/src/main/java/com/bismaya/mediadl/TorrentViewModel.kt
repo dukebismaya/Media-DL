@@ -107,10 +107,21 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
     private val notifiedComplete: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private var observerJob: Job? = null
 
+    // ── Completed-torrent persistence ──
+    private val completedPrefs
+        get() = appContext.getSharedPreferences("torrent_completed_set", Context.MODE_PRIVATE)
+
+    private fun persistCompletedSet() {
+        completedPrefs.edit().putStringSet("hashes", autoPausedForSeeding.toSet()).apply()
+    }
+
     // ── Init ──
     init {
         try {
             loadSettings()
+            // Restore hashes that survived app kill
+            val saved = completedPrefs.getStringSet("hashes", emptySet()) ?: emptySet()
+            autoPausedForSeeding.addAll(saved)
             startEngine()
         } catch (e: Exception) {
             Log.e("TorrentVM", "Init failed", e)
@@ -178,11 +189,13 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
 
                     if (isNewlySeeding && prefs.stopSeedingOnComplete && item.infoHash !in autoPausedForSeeding) {
                         autoPausedForSeeding.add(item.infoHash)
+                        persistCompletedSet()
                         TorrentBridge.pauseTorrent(item.infoHash)
                     }
                     if (item.state == TorrentState.SEEDING && prefs.maxSeedRatio > 0f &&
                         item.shareRatio >= prefs.maxSeedRatio && item.infoHash !in autoPausedForSeeding) {
                         autoPausedForSeeding.add(item.infoHash)
+                        persistCompletedSet()
                         TorrentBridge.pauseTorrent(item.infoHash)
                     }
                 }
@@ -203,6 +216,7 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
                     torrents.removeAll { it.infoHash == deletedId }
                     notifiedComplete.remove(deletedId)
                     autoPausedForSeeding.remove(deletedId)
+                    persistCompletedSet()
                     prevTorrentStates.remove(deletedId)
                 }
             }
@@ -528,6 +542,7 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
         }
         // Reset auto-pause cache when seeding settings change
         autoPausedForSeeding.clear()
+        persistCompletedSet()
     }
 
     private fun checkBatteryOptimization() {

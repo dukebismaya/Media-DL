@@ -316,7 +316,14 @@ private fun TorrentTabBar(activeTab: TorrentTab, onTabSelect: (TorrentTab) -> Un
                             .background(Cyan.copy(alpha = 0.2f)),
                         contentAlignment = Alignment.Center
                     ) {
-                        Text("$activeCount", color = Cyan, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        Text(
+                            "$activeCount",
+                            color = Cyan,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            lineHeight = 10.sp,
+                            modifier = Modifier.offset(y = (-0.5).dp)
+                        )
                     }
                 }
             }
@@ -1326,11 +1333,11 @@ private fun TorrentExpandedPanel(
 
 @Composable
 private fun TorrentInfoRow(icon: ImageVector, label: String, value: String) {
-    Row(verticalAlignment = Alignment.Top) {
-        Icon(icon, null, tint = TextTertiary, modifier = Modifier.size(14.dp).padding(top = 1.dp))
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Icon(icon, null, tint = TextTertiary, modifier = Modifier.size(14.dp))
         Spacer(modifier = Modifier.width(8.dp))
-        Text(label, color = TextTertiary, fontSize = 11.sp, modifier = Modifier.width(82.dp))
-        Text(value, color = TextSecondary, fontSize = 11.sp, modifier = Modifier.weight(1f))
+        Text(label, color = TextTertiary, fontSize = 11.sp, lineHeight = 11.sp, modifier = Modifier.width(82.dp))
+        Text(value, color = TextSecondary, fontSize = 11.sp, lineHeight = 11.sp, modifier = Modifier.weight(1f))
     }
 }
 
@@ -1919,9 +1926,9 @@ private fun TorrentStatPill(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.Center
     ) {
-        Icon(icon, null, tint = color, modifier = Modifier.size(14.dp))
+        Icon(icon, null, tint = color, modifier = Modifier.size(14.dp).offset(y = 0.5.dp))
         Spacer(modifier = Modifier.width(6.dp))
-        Text(label, color = color, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+        Text(label, color = color, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, lineHeight = 11.sp)
     }
 }
 
