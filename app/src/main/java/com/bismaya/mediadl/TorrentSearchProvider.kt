@@ -22,7 +22,8 @@ data class TorrentSearchResult(
     val seeders: Int,
     val leechers: Int,
     val category: String,
-    val addedTimestamp: Long
+    val addedTimestamp: Long,
+    val source: String = ""
 ) {
     val magnetUri: String
         get() {
@@ -139,7 +140,8 @@ object TorrentSearchProvider {
                         seeders = t.optInt("seeds", 0),
                         leechers = t.optInt("peers", 0),
                         category = "Video",
-                        addedTimestamp = t.optLong("date_uploaded_unix", 0)
+                        addedTimestamp = t.optLong("date_uploaded_unix", 0),
+                        source = "YTS"
                     ))
                 }
             }
@@ -171,7 +173,8 @@ object TorrentSearchProvider {
             size = obj.optLong("size", 0),
             seeders = obj.optInt("seeders", 0), leechers = obj.optInt("leechers", 0),
             category = apibayCategory(obj.optString("category", "0")),
-            addedTimestamp = obj.optLong("added", 0)
+            addedTimestamp = obj.optLong("added", 0),
+            source = "TPB"
         )
     }
 
@@ -204,7 +207,8 @@ object TorrentSearchProvider {
             size = obj.optLong("bytes", obj.optLong("size", 0)),
             seeders = obj.optInt("seeders", 0), leechers = obj.optInt("leechers", 0),
             category = inferCategory(cat),
-            addedTimestamp = obj.optLong("uploadDate", 0)
+            addedTimestamp = obj.optLong("uploadDate", 0),
+            source = "Knaben"
         )
     }
 
@@ -230,7 +234,8 @@ object TorrentSearchProvider {
                     size = obj.optLong("size_bytes", 0),
                     seeders = obj.optInt("seeders", 0), leechers = obj.optInt("leechers", 0),
                     category = inferCategory(name),
-                    addedTimestamp = 0L
+                    addedTimestamp = 0L,
+                    source = "TorrCSV"
                 ))
             }
         }
@@ -259,7 +264,8 @@ object TorrentSearchProvider {
                     seeders = swarm?.optInt("seeders", 0) ?: obj.optInt("seeders", 0),
                     leechers = swarm?.optInt("leechers", 0) ?: obj.optInt("leechers", 0),
                     category = inferCategory(obj.optString("category", name)),
-                    addedTimestamp = 0L
+                    addedTimestamp = 0L,
+                    source = "Solid"
                 ))
             }
         }
@@ -307,7 +313,8 @@ object TorrentSearchProvider {
                             results += TorrentSearchResult(
                                 name = title, infoHash = hash,
                                 size = size, seeders = seeders, leechers = leechers,
-                                category = category, addedTimestamp = 0L
+                                category = category, addedTimestamp = 0L,
+                                source = "Nyaa"
                             )
                         }
                         inItem = false

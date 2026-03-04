@@ -692,6 +692,27 @@ private fun SearchResultCard(
                         ) {
                             Text(result.category, color = catColor, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
                         }
+                        if (result.source.isNotBlank()) {
+                            val srcColor = when (result.source) {
+                                "YTS"     -> Amber
+                                "TPB"     -> VioletLight
+                                "Knaben"  -> Color(0xFF29B6F6)
+                                "TorrCSV" -> Emerald
+                                "Solid"   -> Color(0xFFAB47BC)
+                                "Nyaa"    -> Rose
+                                else      -> TextTertiary
+                            }
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(srcColor.copy(alpha = 0.1f))
+                                    .border(0.5.dp, srcColor.copy(alpha = 0.35f), RoundedCornerShape(4.dp))
+                                    .padding(horizontal = 5.dp, vertical = 2.dp)
+                            ) {
+                                Text(result.source, color = srcColor, fontSize = 9.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                        }
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
                             TorrentSearchProvider.formatFileSize(result.size),
