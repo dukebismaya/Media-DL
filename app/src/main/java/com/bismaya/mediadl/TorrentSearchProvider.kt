@@ -2,19 +2,24 @@ package com.bismaya.mediadl
 
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import okhttp3.Dns
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
 import java.io.StringReader
-import java.net.HttpURLConnection
-import java.net.URL
+import java.net.InetAddress
 import java.net.URLEncoder
+import java.util.concurrent.TimeUnit
 
 data class TorrentSearchResult(
     val name: String,
@@ -87,22 +92,33 @@ object TorrentSearchProvider {
     private val HASH_RE = Regex("[0-9a-fA-F]{40}([0-9a-fA-F]{24})?")
 
     /** Total number of search providers (used to track streaming progress). */
-    const val PROVIDER_COUNT = 9
+    const val PROVIDER_COUNT = 10
+
+    /** Browser-like User-Agent — required for scraping sites like 1337x. */
+    private const val BROWSER_UA =
+        "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36"
 
     /** Score used for result ranking: seeders dominate, leechers add minor weight. */
     private fun score(r: TorrentSearchResult): Double = r.seeders + 0.15 * r.leechers
 
+    /** Per-provider outcome reported via [searchStreaming]. */
+    data class ProviderStatus(
+        val name: String,
+        val count: Int,      // results contributed (unique, after dedup)
+        val failed: Boolean  // true = threw exception or got no HTTP response
+    )
+
     // ── Public entry point (streaming) ─────────────────────────────────────────
     //
-    // [onPartialResult] is called on the Main thread each time any provider
-    // completes, with the full deduplicated + score-sorted result list so far.
-    // [onProgress] is called on the Main thread with (doneCount, PROVIDER_COUNT).
-    // Total wait time = slowest single provider, not the sum of all.
+    // [onPartialResult] is called on Main each time a provider finishes with ≥1 new result.
+    // [onProgress]      is called on Main with (doneCount, PROVIDER_COUNT).
+    // [onProviderDone]  is called on Main for EVERY provider with its status.
 
     suspend fun searchStreaming(
         query: String,
         onPartialResult: (List<TorrentSearchResult>) -> Unit,
-        onProgress: (done: Int, total: Int) -> Unit = { _, _ -> }
+        onProgress: (done: Int, total: Int) -> Unit = { _, _ -> },
+        onProviderDone: (ProviderStatus) -> Unit = {}
     ) {
         val mutex = Mutex()
         val seen  = mutableSetOf<String>()
@@ -111,28 +127,33 @@ object TorrentSearchProvider {
 
         withContext(Dispatchers.IO) {
             coroutineScope {
-                val providers: List<() -> Result<List<TorrentSearchResult>>> = listOf(
-                    { searchYts(query) },
-                    { searchApibay(query) },
-                    { searchKnaben(query) },
-                    { searchTorrentCsv(query) },
-                    { searchSolidtorrents(query) },
-                    { searchNyaa(query) },
-                    { searchBitsearch(query) },
-                    { searchTorrentz2(query) },
-                    { searchLimetorrents(query) }
+                val providers: List<Pair<String, suspend () -> Result<List<TorrentSearchResult>>>> = listOf(
+                    "YTS"     to { searchYts(query) },
+                    "TPB"     to { searchApibay(query) },
+                    "Knaben"  to { searchKnaben(query) },
+                    "TorrCSV" to { searchTorrentCsv(query) },
+                    "Solid"   to { searchSolidtorrents(query) },
+                    "Nyaa"    to { searchNyaa(query) },
+                    "EZTV"   to { searchEztv(query) },
+                    "TorDL"   to { searchTorrentDownloads(query) },
+                    "LimeTrr" to { searchLimetorrents(query) },
+                    "1337x"   to { searchLeet337x(query) }
                 )
-                providers.forEach { provider ->
+                providers.forEach { (name, provider) ->
                     launch {
-                        val results = provider().getOrNull().orEmpty()
+                        val result  = provider()
+                        val raw     = result.getOrNull().orEmpty()
+                        val failed  = result.isFailure
                         mutex.withLock {
                             done++
-                            val newOnes = results.filter { seen.add(it.infoHash) }
+                            val newOnes = raw.filter { seen.add(it.infoHash) }
                             accum.addAll(newOnes)
                             val snapshot = accum.sortedByDescending { score(it) }
                             val d = done
+                            val status = ProviderStatus(name, newOnes.size, failed)
                             withContext(Dispatchers.Main) {
                                 onProgress(d, PROVIDER_COUNT)
+                                onProviderDone(status)
                                 if (snapshot.isNotEmpty()) onPartialResult(snapshot)
                             }
                         }
@@ -148,7 +169,7 @@ object TorrentSearchProvider {
 
     private fun searchYts(query: String): Result<List<TorrentSearchResult>> = runCatching {
         val body = httpGet(
-            "https://yts.mx/api/v2/list_movies.json?query_term=${enc(query)}&limit=50&sort_by=seeds"
+            "https://movies-api.accel.li/api/v2/list_movies.json?query_term=${enc(query)}&limit=50&sort_by=seeds&order_by=desc&minimum_rating=0"
         ) ?: return Result.failure(Exception("YTS: no response"))
         val root = JSONObject(body)
         if (root.optString("status") != "ok") return Result.success(emptyList())
@@ -224,9 +245,10 @@ object TorrentSearchProvider {
     // ══════════════════════════════════════════════════════════════════
 
     private fun searchKnaben(query: String): Result<List<TorrentSearchResult>> = runCatching {
-        val body = httpGet(
-            "https://knaben.eu/api/v1/?search=${enc(query)}&orderBy=seeders&orderDirection=desc&size=50&hideFake=true"
-        ) ?: return Result.failure(Exception("Knaben: no response"))
+        val body = httpGetWithFallback(listOf(
+            "https://knaben.eu/api/v1/?search=${enc(query)}&orderBy=seeders&orderDirection=desc&size=50&hideFake=true",
+            "https://knaben.org/api/v1/?search=${enc(query)}&orderBy=seeders&orderDirection=desc&size=50&hideFake=true"
+        )) ?: return Result.failure(Exception("Knaben: no response"))
         if (!body.trimStart().startsWith("{")) return Result.failure(Exception("Knaben: non-JSON"))
         val hits = JSONObject(body).optJSONArray("hits") ?: return Result.success(emptyList())
         buildList { for (i in 0 until hits.length()) parseKnabenObject(hits.getJSONObject(i))?.let { add(it) } }
@@ -281,9 +303,10 @@ object TorrentSearchProvider {
     // ══════════════════════════════════════════════════════════════════
 
     private fun searchSolidtorrents(query: String): Result<List<TorrentSearchResult>> = runCatching {
-        val body = httpGet(
-            "https://solidtorrents.to/api/v1/search?q=${enc(query)}&sort=seeders&limit=50"
-        ) ?: return Result.failure(Exception("Solidtorrents: no response"))
+        val body = httpGetWithFallback(listOf(
+            "https://solidtorrents.to/api/v1/search?q=${enc(query)}&sort=seeders&limit=50",
+            "https://solidtorrents.net/api/v1/search?q=${enc(query)}&sort=seeders&limit=50"
+        )) ?: return Result.failure(Exception("Solidtorrents: no response"))
         if (!body.trimStart().startsWith("{")) return Result.failure(Exception("Solidtorrents: non-JSON"))
         val results = JSONObject(body).optJSONArray("results") ?: return Result.success(emptyList())
         buildList {
@@ -382,48 +405,57 @@ object TorrentSearchProvider {
     }
 
     // ══════════════════════════════════════════════════════════════════
-    // Provider 7 — Bitsearch.to  (JSON aggregator, broad coverage)
+    // Provider 7 — EZTV  (TV shows, JSON REST API)
     // ══════════════════════════════════════════════════════════════════
 
-    private fun searchBitsearch(query: String): Result<List<TorrentSearchResult>> = runCatching {
-        val body = httpGet(
-            "https://bitsearch.to/api/v1/torrents?q=${enc(query)}&cat=0&limit=50&page=1"
-        ) ?: return Result.failure(Exception("Bitsearch: no response"))
-        if (!body.trimStart().startsWith("{")) return Result.failure(Exception("Bitsearch: non-JSON"))
-        val data = JSONObject(body).optJSONArray("data") ?: return Result.success(emptyList())
+    private fun searchEztv(query: String): Result<List<TorrentSearchResult>> = runCatching {
+        val body = httpGetWithFallback(listOf(
+            "https://eztvx.to/api/get-torrents?limit=50&page=1&search=${enc(query)}",
+            "https://eztv.re/api/get-torrents?limit=50&page=1&search=${enc(query)}",
+            "https://eztv.wf/api/get-torrents?limit=50&page=1&search=${enc(query)}"
+        )) ?: return Result.failure(Exception("EZTV: no response"))
+        if (!body.trimStart().startsWith("{")) return Result.failure(Exception("EZTV: non-JSON"))
+        val torrents = JSONObject(body).optJSONArray("torrents") ?: return Result.success(emptyList())
+        // EZTV returns the latest torrents (ignoring the query) when there are no matches,
+        // so filter client-side to keep only results that actually match the search terms.
+        val queryWords = query.lowercase().split("\\s+".toRegex()).filter { it.length >= 2 }
         buildList {
-            for (i in 0 until data.length()) {
-                val obj = data.getJSONObject(i)
-                val hash = obj.optString("info_hash", "")
-                val name = obj.optString("title", obj.optString("name", ""))
+            for (i in 0 until torrents.length()) {
+                val obj = torrents.getJSONObject(i)
+                val hash = obj.optString("hash", "")
+                val name = obj.optString("title", obj.optString("filename", ""))
                 if (hash.isBlank() || name.isBlank() || !hash.matches(HASH_RE)) continue
+                val nameLc = name.lowercase()
+                if (queryWords.none { nameLc.contains(it) }) continue
                 add(TorrentSearchResult(
                     name = name, infoHash = hash.lowercase(),
-                    size = obj.optLong("size", 0),
+                    size = obj.optLong("size_bytes", 0),
                     seeders = obj.optInt("seeds", 0),
-                    leechers = obj.optInt("leechs", 0),
-                    category = inferCategory(obj.optString("category", name)),
-                    addedTimestamp = 0L,
-                    source = "Bitsrch"
+                    leechers = obj.optInt("peers", 0),
+                    category = "Video",
+                    addedTimestamp = obj.optLong("date_released_unix", 0),
+                    source = "EZTV"
                 ))
             }
         }
-    }.also { if (it.isFailure) Log.e(TAG, "Bitsearch failed", it.exceptionOrNull()) }
+    }.also { if (it.isFailure) Log.e(TAG, "EZTV failed", it.exceptionOrNull()) }
 
     // ══════════════════════════════════════════════════════════════════
-    // Provider 8 — Torrentz2  (meta-search RSS, very broad index)
+    // Provider 8 — TorrentDownloads  (general, RSS XML)
     // ══════════════════════════════════════════════════════════════════
 
-    private fun searchTorrentz2(query: String): Result<List<TorrentSearchResult>> = runCatching {
-        val body = httpGet("https://torrentz2eu.org/feed?q=${enc(query)}")
-            ?: return Result.failure(Exception("Torrentz2: no response"))
+    private fun searchTorrentDownloads(query: String): Result<List<TorrentSearchResult>> = runCatching {
+        val body = httpGetWithFallback(listOf(
+            "https://www.torrentdownloads.pro/rss.xml?type=search&search=${enc(query)}",
+            "https://www.torrentdownloads.me/rss.xml?type=search&search=${enc(query)}"
+        )) ?: return Result.failure(Exception("TorrentDL: no response"))
 
         val factory = XmlPullParserFactory.newInstance().apply { isNamespaceAware = true }
         val xpp = factory.newPullParser().apply { setInput(StringReader(body)) }
 
         val results = mutableListOf<TorrentSearchResult>()
         var inItem = false
-        var title = ""; var hash = ""; var desc = ""
+        var title = ""; var hash = ""; var size = 0L; var seeds = 0; var leechers = 0
         var currentTag = ""
 
         var event = xpp.eventType
@@ -431,21 +463,23 @@ object TorrentSearchProvider {
             when (event) {
                 XmlPullParser.START_TAG -> {
                     currentTag = xpp.name ?: ""
-                    if (currentTag == "item") { inItem = true; title = ""; hash = ""; desc = "" }
+                    if (currentTag == "item") {
+                        inItem = true; title = ""; hash = ""; size = 0L; seeds = 0; leechers = 0
+                    }
                 }
                 XmlPullParser.TEXT -> if (inItem) when (currentTag) {
-                    "title"       -> title = xpp.text.trim()
-                    "link"        -> HASH_RE.find(xpp.text.trim())?.let { hash = it.value.lowercase() }
-                    "description" -> desc  = xpp.text.trim()
+                    "title"     -> title    = xpp.text.trim()
+                    "info_hash" -> hash     = xpp.text.trim().lowercase()
+                    "size"      -> size     = xpp.text.trim().toLongOrNull() ?: 0L
+                    "seeders"   -> seeds    = xpp.text.trim().toIntOrNull() ?: 0
+                    "leechers"  -> leechers = xpp.text.trim().toIntOrNull() ?: 0
                 }
                 XmlPullParser.END_TAG -> {
-                    if (xpp.name == "item" && inItem && hash.isNotBlank() && title.isNotBlank()) {
-                        val seeders  = Regex("(\\d+)\\s*seed",  RegexOption.IGNORE_CASE).find(desc)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-                        val leechers = Regex("(\\d+)\\s*leech", RegexOption.IGNORE_CASE).find(desc)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                    if (xpp.name == "item" && inItem && hash.isNotBlank() && hash.matches(HASH_RE) && title.isNotBlank()) {
                         results += TorrentSearchResult(
                             name = title, infoHash = hash,
-                            size = parseHumanSize(desc), seeders = seeders, leechers = leechers,
-                            category = inferCategory(title), addedTimestamp = 0L, source = "Torrntz"
+                            size = size, seeders = seeds, leechers = leechers,
+                            category = inferCategory(title), addedTimestamp = 0L, source = "TorDL"
                         )
                     }
                     if (xpp.name == "item") inItem = false
@@ -455,15 +489,17 @@ object TorrentSearchProvider {
             event = xpp.next()
         }
         results
-    }.also { if (it.isFailure) Log.e(TAG, "Torrentz2 failed", it.exceptionOrNull()) }
+    }.also { if (it.isFailure) Log.e(TAG, "TorrentDownloads failed", it.exceptionOrNull()) }
 
     // ══════════════════════════════════════════════════════════════════
     // Provider 9 — Lime Torrents  (RSS, hash extracted from guid URL)
     // ══════════════════════════════════════════════════════════════════
 
     private fun searchLimetorrents(query: String): Result<List<TorrentSearchResult>> = runCatching {
-        val body = httpGet("https://www.limetorrents.lol/searchrss/all/${enc(query)}/")
-            ?: return Result.failure(Exception("LimeTorrents: no response"))
+        val body = httpGetWithFallback(listOf(
+            "https://www.limetorrents.fun/searchrss/all/${enc(query)}/",
+            "https://www.limetorrents.lol/searchrss/all/${enc(query)}/"
+        )) ?: return Result.failure(Exception("LimeTorrents: no response"))
 
         val factory = XmlPullParserFactory.newInstance().apply { isNamespaceAware = true }
         val xpp = factory.newPullParser().apply { setInput(StringReader(body)) }
@@ -512,6 +548,89 @@ object TorrentSearchProvider {
     }.also { if (it.isFailure) Log.e(TAG, "LimeTorrents failed", it.exceptionOrNull()) }
 
     // ══════════════════════════════════════════════════════════════════
+    // Provider 10 — 1337x  (HTML scrape: search page + parallel detail pages for magnets)
+    // ══════════════════════════════════════════════════════════════════
+
+    private suspend fun searchLeet337x(query: String): Result<List<TorrentSearchResult>> = runCatching {
+        // Step 1: fetch search results page (try mirror domains if primary is blocked)
+        val mirrors = listOf("1337x.to", "x1337x.ws", "x1337x.eu", "1337x.st")
+        var searchBody: String? = null
+        var activeDomain = mirrors.first()
+        for (domain in mirrors) {
+            searchBody = httpGet("https://$domain/search/${enc(query)}/1/", BROWSER_UA)
+            if (searchBody != null) { activeDomain = domain; break }
+        }
+        if (searchBody == null) return Result.failure(Exception("1337x: no response from any mirror"))
+
+        val tbody = searchBody.substringAfter("<tbody>", "").substringBefore("</tbody>", "")
+        if (tbody.isBlank()) return Result.success(emptyList())
+
+        // Regex patterns against each <tr>…</tr> fragment
+        val hrefRe  = Regex("""href="(/torrent/\d+/[^"]+/)""")
+        val nameRe  = Regex("""<a href="/torrent/\d+/[^"]+/">([^<]+)</a>""")
+        val seedsRe = Regex("""<td class="seeds">(\d+)</td>""")
+        val leechRe = Regex("""<td class="leeches">(\d+)</td>""")
+        val sizeRe  = Regex("""<td class="size"[^>]*>([\d.,]+\s*[KMGTkmgt]?i?B)""")
+        val catRe   = Regex("""icon-type.*?<a[^>]*>([^<]+)</a>""", RegexOption.DOT_MATCHES_ALL)
+
+        data class Row(val path: String, val name: String, val seeds: Int, val leeches: Int,
+                       val sizeStr: String, val catRaw: String)
+
+        val rows = tbody.split("</tr>").mapNotNull { row ->
+            if (!row.contains("/torrent/")) return@mapNotNull null
+            val path  = hrefRe.find(row)?.groupValues?.get(1) ?: return@mapNotNull null
+            val name  = nameRe.find(row)?.groupValues?.get(1)?.trim()?.takeIf { it.isNotBlank() }
+                ?: return@mapNotNull null
+            val seeds   = seedsRe.find(row)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            val leeches = leechRe.find(row)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            val sizeStr = sizeRe.find(row)?.groupValues?.get(1) ?: ""
+            val catRaw  = catRe.find(row)?.groupValues?.get(1)?.trim() ?: ""
+            Row(path, name, seeds, leeches, sizeStr, catRaw)
+        }.take(15)  // cap to avoid too many follow-up requests
+
+        if (rows.isEmpty()) return Result.success(emptyList())
+
+        // Step 2: parallel fetch each torrent detail page using the same working mirror
+        val magnetRe = Regex("""href="(magnet:\?xt=urn:btih:[^"]+)""")
+        coroutineScope {
+            rows.map { row ->
+                async {
+                    runCatching {
+                        val detail = httpGet("https://$activeDomain${row.path}", BROWSER_UA)
+                            ?: return@runCatching null
+                        val magnetUri = magnetRe.find(detail)?.groupValues?.get(1)
+                            ?: return@runCatching null
+                        val hash = HASH_RE.find(magnetUri)?.value?.lowercase()
+                            ?: return@runCatching null
+                        TorrentSearchResult(
+                            name = row.name,
+                            infoHash = hash,
+                            size = parseHumanSize(row.sizeStr),
+                            seeders = row.seeds,
+                            leechers = row.leeches,
+                            category = leet337xCategory(row.catRaw),
+                            addedTimestamp = 0L,
+                            source = "1337x"
+                        )
+                    }.getOrNull()
+                }
+            }.awaitAll().filterNotNull()
+        }
+    }.also { if (it.isFailure) Log.e(TAG, "1337x failed", it.exceptionOrNull()) }
+
+    private fun leet337xCategory(cat: String) = when {
+        cat.contains("Movie", ignoreCase = true) || cat.contains("TV", ignoreCase = true)
+            || cat.contains("Video", ignoreCase = true)         -> "Video"
+        cat.contains("Music", ignoreCase = true)
+            || cat.contains("Audio", ignoreCase = true)         -> "Audio"
+        cat.contains("Anime", ignoreCase = true)                -> "Anime"
+        cat.contains("Game", ignoreCase = true)                 -> "Games"
+        cat.contains("App", ignoreCase = true)
+            || cat.contains("Software", ignoreCase = true)      -> "Apps"
+        else                                                    -> inferCategory(cat)
+    }
+
+    // ══════════════════════════════════════════════════════════════════
     // Shared helpers
     // ══════════════════════════════════════════════════════════════════
 
@@ -544,17 +663,101 @@ object TorrentSearchProvider {
 
     private fun enc(q: String) = URLEncoder.encode(q.trim(), "UTF-8")
 
-    private fun httpGet(urlStr: String): String? = try {
-        val conn = URL(urlStr).openConnection() as HttpURLConnection
-        conn.connectTimeout = 6_000
-        conn.readTimeout    = 6_000
-        conn.setRequestProperty("User-Agent", "MediaDL/1.0")
-        conn.setRequestProperty("Accept",     "*/*")
-        if (conn.responseCode != 200) {
-            Log.w(TAG, "HTTP ${conn.responseCode} → $urlStr")
-            conn.disconnect(); null
-        } else {
-            conn.inputStream.bufferedReader().use { it.readText() }.also { conn.disconnect() }
+    // ── HTTP client ────────────────────────────────────────────────────────────
+    //
+    // Uses OkHttp with a Cloudflare DNS-over-HTTPS resolver.
+    //
+    // WHY: Many ISPs (especially in South/Southeast Asia) block torrent-related
+    // domains via DNS poisoning — the DNS query for "yts.mx", "1337x.to", etc.
+    // returns a wrong IP or NXDOMAIN. By resolving hostnames through Cloudflare's
+    // HTTPS endpoint (1.1.1.1) instead of the system resolver, we bypass ISP DNS
+    // blocking entirely. The DoH request itself goes to the IP 1.1.1.1 directly
+    // (no DNS lookup needed for it), so there’s no circular dependency.
+
+    /** OkHttp client used for the DoH bootstrap (connects to 1.1.1.1 by IP, no DNS). */
+    private val bootstrapClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(5, TimeUnit.SECONDS)
+            .build()
+    }
+
+    /**
+     * Custom DNS resolver that queries Cloudflare 1.1.1.1 over HTTPS.
+     * Falls back to the system resolver if DoH fails for any reason.
+     */
+    private val cloudflareDoH = object : Dns {
+        override fun lookup(hostname: String): List<InetAddress> {
+            return try {
+                // Connect to Cloudflare's 1.1.1.1 by IP — no DNS resolution required here.
+                val url = "https://1.1.1.1/dns-query?name=${URLEncoder.encode(hostname, "UTF-8")}&type=A"
+                val request = Request.Builder()
+                    .url(url)
+                    .header("Accept", "application/dns-json")
+                    .header("User-Agent", "MediaDL/1.0")
+                    .build()
+                val body = bootstrapClient.newCall(request).execute().use { resp ->
+                    resp.body?.string()
+                } ?: return Dns.SYSTEM.lookup(hostname)
+                val answers = JSONObject(body).optJSONArray("Answer")
+                    ?: return Dns.SYSTEM.lookup(hostname)
+                val ips = mutableListOf<InetAddress>()
+                for (i in 0 until answers.length()) {
+                    val a = answers.getJSONObject(i)
+                    if (a.optInt("type") == 1) {  // type 1 = A record (IPv4)
+                        try { ips.add(InetAddress.getByName(a.optString("data"))) }
+                        catch (_: Exception) {}
+                    }
+                }
+                if (ips.isEmpty()) Dns.SYSTEM.lookup(hostname)
+                else { Log.d(TAG, "DoH → $hostname = ${ips.first()}"); ips }
+            } catch (e: Exception) {
+                Log.w(TAG, "DoH failed for $hostname (${e.message}), falling back to system DNS")
+                Dns.SYSTEM.lookup(hostname)
+            }
+        }
+    }
+
+    /** Main OkHttpClient — uses DoH for DNS, browser-like headers, 10 s timeouts. */
+    private val httpClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .dns(cloudflareDoH)
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
+            .writeTimeout(10, TimeUnit.SECONDS)
+            .build()
+    }
+
+    /**
+     * Try multiple URLs in order, returning the first successful response body.
+     * Useful for providers with mirror domains.
+     */
+    private fun httpGetWithFallback(
+        urls: List<String>,
+        userAgent: String = BROWSER_UA
+    ): String? {
+        for (url in urls) {
+            val result = httpGet(url, userAgent)
+            if (result != null) return result
+        }
+        return null
+    }
+
+    private fun httpGet(urlStr: String, userAgent: String = BROWSER_UA): String? = try {
+        val request = Request.Builder()
+            .url(urlStr)
+            .header("User-Agent",      userAgent)
+            .header("Accept",          "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8")
+            .header("Accept-Language", "en-US,en;q=0.5")
+            .header("Connection",      "keep-alive")
+            .build()
+        httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                Log.w(TAG, "HTTP ${response.code} → $urlStr")
+                null
+            } else {
+                response.body?.string()
+            }
         }
     } catch (e: Exception) {
         Log.e(TAG, "httpGet: $urlStr — ${e.message}")

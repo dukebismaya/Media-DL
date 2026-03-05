@@ -580,12 +580,74 @@ private fun SearchTabContent(vm: TorrentViewModel) {
         }
 
         val streamingLabel = if (vm.isSearching) " · ${vm.searchProvidersDone}/${vm.searchProvidersTotal} sources" else ""
-        Text(
-            "${filteredResults.size} results${if (filteredResults.size != vm.searchResults.size) " (filtered from ${vm.searchResults.size})" else ""}$streamingLabel",
-            color = TextTertiary,
-            fontSize = 12.sp,
-            modifier = Modifier.padding(horizontal = 20.dp)
-        )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                "${filteredResults.size} results${if (filteredResults.size != vm.searchResults.size) " (filtered from ${vm.searchResults.size})" else ""}$streamingLabel",
+                color = TextTertiary,
+                fontSize = 12.sp,
+                modifier = Modifier.weight(1f)
+            )
+            // Sources status button
+            if (vm.providerStatuses.isNotEmpty()) {
+                var showSources by remember { mutableStateOf(false) }
+                TextButton(
+                    onClick = { showSources = !showSources },
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                ) {
+                    val okCount  = vm.providerStatuses.count { !it.failed && it.count > 0 }
+                    val zeroCount = vm.providerStatuses.count { !it.failed && it.count == 0 }
+                    val failCount = vm.providerStatuses.count { it.failed }
+                    Text(
+                        "✔️$okCount ⚠️$zeroCount ❌$failCount",
+                        fontSize = 11.sp,
+                        color = TextTertiary
+                    )
+                }
+                if (showSources) {
+                    AlertDialog(
+                        onDismissRequest = { showSources = false },
+                        containerColor = Ink3,
+                        titleContentColor = TextPrimary,
+                        title = { Text("Source Status", fontWeight = FontWeight.Bold, fontSize = 15.sp) },
+                        text = {
+                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                vm.providerStatuses
+                                    .sortedWith(compareBy({ it.failed }, { it.count == 0 }, { -it.count }))
+                                    .forEach { s ->
+                                        val (tint, icon, detail) = when {
+                                            s.failed       -> Triple(Rose,   "❌", "Failed")
+                                            s.count == 0   -> Triple(Amber,  "⚠️", "No results")
+                                            else           -> Triple(Emerald, "✔️", "${s.count} result${if (s.count == 1) "" else "s"}")
+                                        }
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clip(RoundedCornerShape(8.dp))
+                                                .background(tint.copy(alpha = 0.07f))
+                                                .padding(horizontal = 10.dp, vertical = 7.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.SpaceBetween
+                                        ) {
+                                            Text("$icon  ${s.name}", color = tint, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                            Text(detail, color = tint.copy(alpha = 0.75f), fontSize = 12.sp)
+                                        }
+                                    }
+                            }
+                        },
+                        confirmButton = {
+                            TextButton(onClick = { showSources = false }) {
+                                Text("Close", color = VioletLight)
+                            }
+                        }
+                    )
+                }
+            }
+        }
         Spacer(modifier = Modifier.height(8.dp))
 
         filteredResults.forEach { result ->
@@ -682,6 +744,7 @@ private fun SearchResultCard(
                                 "Bitsrch" -> Color(0xFF00BCD4)
                                 "Torrntz" -> Color(0xFFFF7043)
                                 "LimeTrr" -> Color(0xFF66BB6A)
+                                "1337x"   -> Color(0xFFFF5722)
                                 else      -> TextTertiary
                             }
                             Spacer(modifier = Modifier.width(6.dp))

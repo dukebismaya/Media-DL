@@ -147,6 +147,9 @@ dependencies {
     // ── Coroutines → RxJava3 bridge (TorrentBridge.kt uses Flowable.asFlow()) ──
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-reactive:1.8.1")
 
+    // ── OkHttp (robust HTTP client with DoH support for bypassing ISP DNS blocks) ─
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
     // ── Moshi (SettingsRepositoryImpl serialises preferences as JSON) ────────
     implementation("com.squareup.moshi:moshi:1.15.2")
     implementation("com.squareup.moshi:moshi-adapters:1.15.2")

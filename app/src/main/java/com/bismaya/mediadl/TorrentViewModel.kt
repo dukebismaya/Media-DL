@@ -63,6 +63,8 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
     var searchProvidersDone by mutableStateOf(0)
         private set
     val searchProvidersTotal: Int = TorrentSearchProvider.PROVIDER_COUNT
+    /** Per-provider outcome — populated live as each provider finishes. */
+    val providerStatuses = mutableStateListOf<TorrentSearchProvider.ProviderStatus>()
     private var searchJob: Job? = null
     val torrentSearchRecords = mutableStateListOf<TorrentSearchRecord>()
 
@@ -469,6 +471,7 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
         searchError = null
         searchResults = emptyList()
         searchProvidersDone = 0
+        providerStatuses.clear()
         searchJob = viewModelScope.launch {    // Main dispatcher — callbacks land here safely
             var gotAny = false
             TorrentSearchProvider.searchStreaming(
@@ -479,6 +482,9 @@ class TorrentViewModel(application: Application) : AndroidViewModel(application)
                 },
                 onProgress = { done, _ ->
                     searchProvidersDone = done
+                },
+                onProviderDone = { status ->
+                    providerStatuses.add(status)
                 }
             )
             // All 9 providers have now finished (or been cancelled)
